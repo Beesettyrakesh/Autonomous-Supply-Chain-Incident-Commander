@@ -15,7 +15,8 @@ placeholder profiles to context-driven calculations that read real signals off t
 
 from __future__ import annotations
 
-from typing import Any, Dict, TypedDict
+from typing import Any, Dict, Optional, TypedDict
+
 
 
 class FinanceSimulationResult(TypedDict):
@@ -37,12 +38,15 @@ class StrategyScoreResult(TypedDict):
     composite_score: float
 
 
-def simulate_finance(delay_days: int, state_ledger_snapshot: Dict[str, Any]) -> FinanceSimulationResult:
+def simulate_finance(delay_days: Optional[int], state_ledger_snapshot: Dict[str, Any]) -> FinanceSimulationResult:
     """
     Calculate concrete cash-flow impact and downtime penalty parameters.
 
     Args:
-        delay_days: Number of days the shipment / resolution is delayed (>= 0).
+        delay_days: Number of days the shipment / resolution is delayed (>= 0). Pass None
+            to fall back to the ledger's observed `metrics.delay_days`. IMPORTANT: an
+            explicit 0 (on-time shipment) is RESPECTED — only None triggers the fallback.
+
         state_ledger_snapshot: A JSON-safe dict snapshot of the current StateLedger. The
             baseline revenue exposure (`metrics.revenue_at_risk_usd`) and the per-diem
             penalty rate (`context.contracted_penalty_rate`) are read directly from it —
@@ -71,6 +75,18 @@ def simulate_finance(delay_days: int, state_ledger_snapshot: Dict[str, Any]) -> 
     contracted_penalty_rate = float(context.get("contracted_penalty_rate", 0.0))
     inventory_days_remaining = int(metrics.get("inventory_days_remaining", 0))
     production_shutdown_hours = int(metrics.get("production_shutdown_hours", 0))
+
+    # Prefer an explicit delay_days argument; otherwise fall back to the delay observed by
+    # query_shipment_tracking and recorded on the ledger (`metrics.delay_days`). This keeps
+    # simulate_finance the SOLE authority on downtime math while still honoring the observed
+    # delay when the caller didn't pass one. NOTE: we check `is None` (NOT falsiness) so an
+    # explicit 0 (on-time shipment) is respected and NOT overwritten by the stale ledger value.
+    if delay_days is None:
+        delay_days = int(metrics.get("delay_days", 0))
+    else:
+        delay_days = int(delay_days)
+
+
 
     # 1) Contractual late-delivery penalty accrues for every delay day.
     daily_penalty_usd = round(revenue_at_risk * contracted_penalty_rate, 2)

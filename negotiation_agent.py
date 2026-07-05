@@ -31,6 +31,8 @@ import re
 from typing import Any, Callable, Dict, Optional
 
 from ledger_store import STORE, LedgerStore
+from llm_utils import generate_with_retry
+
 
 # Scalar-only terms map. Nested objects are forbidden — every value must be a primitive.
 TermsDict = Dict[str, str | int | float]
@@ -123,16 +125,23 @@ async def _llm_vendor_reply(
         f"for {offer_qty} units on a rush order (your standard lead time is "
         f"{lead_time_days} days). Respond per your rules."
     )
-    # google-genai exposes an async client surface via `.aio`.
-    response = await client.aio.models.generate_content(  # type: ignore[union-attr]
+    # Route through the SHARED resilient helper so the Supplier-Persona obeys the SAME
+    # 429/5xx retry + daily-quota escalation policy as the Incident Commander. This is
+    # CRITICAL under concurrent multi-vendor negotiation (asyncio.gather): firing several
+    # simultaneous calls at one endpoint would otherwise trigger un-throttled 429 crashes.
+    response = await generate_with_retry(
+        client,
         model=GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=0.0,
         ),
+        source=f"negotiation:{floor_price:.2f}",
+        log=LedgerStore.append_raw_log,
     )
     return response.text or "Reject."
+
 
 
 # ---------------------------------------------------------------------------- #

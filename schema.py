@@ -54,6 +54,12 @@ class ImpactMetrics(BaseModel):
     production_shutdown_hours: int
     # Guarded value: the Financial Spend Guardrail hard-forks to HUMAN TAKEOVER if this > 5000.00.
     revenue_at_risk_usd: float
+    # Observed shipment delay (days) written by query_shipment_tracking. This is the RAW
+    # observation; simulate_finance is the SOLE authority that converts it into downtime
+    # (only the delay days BEYOND inventory_days_remaining incur shutdown). Kept separate
+    # from production_shutdown_hours so an observation never clobbers the incident baseline.
+    delay_days: int = 0
+
     # Live freight-market cost multiplier (1.0 = baseline). Scales expedited-freight cost
     # scoring in score_strategy; sourced from observation tools / market telemetry.
     market_freight_index_multiplier: float = 1.0
