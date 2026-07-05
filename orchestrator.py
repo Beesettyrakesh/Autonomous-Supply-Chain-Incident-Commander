@@ -28,10 +28,12 @@ Resilience:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union, cast
+
 
 try:
     from dotenv import load_dotenv
@@ -53,13 +55,12 @@ from guardrails import (
     SpendAuthorityResult,
     SPEND_AUTHORITY_LIMIT_USD,
 )
+from llm_utils import generate_with_retry, LLMUnavailableError
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 # Hard circuit-breaker bound mirrored from the schema (loop_count le=11, escalate past 10).
 MAX_LOOPS = 10
-# Transient-error retry policy for the LLM reasoning call (429 / 5xx).
-LLM_MAX_RETRIES = 3
-LLM_RETRY_CAP_SECONDS = 40.0  # never sleep longer than this on a single backoff
+
 
 # Order quantity for the mitigation purchase — the realistic per-incident variable that
 # drives total spend (unit price * qty) against the FIXED spend-authority limit. Configurable
@@ -72,46 +73,62 @@ ORDER_QUANTITY = int(os.environ.get("ORDER_QUANTITY", "500"))
 # its own callable (Approve/Reject buttons) directly, bypassing this env switch.
 HITL_MODE = os.environ.get("HITL_MODE", "cli")
 
-# Type of a human-in-the-loop decision provider: given the breach details, return True to
-# APPROVE the over-limit spend or False to REJECT it.
-HumanDecisionFn = Callable[[SpendAuthorityResult], bool]
+# DEMO TOGGLE (default OFF): force the offline planner to COMMIT the ALT_SUPPLIER strategy
+# regardless of the recorded strategy_scores. This does NOT alter the scores themselves
+# (they stay honest at ALT_SUPPLIER 60.35 / INTERNAL_TRANSFER 80.0 / AIR_FREIGHT 65.28); it
+# only overrides the terminal SELECTION so the ALT_SUPPLIER path runs — which is the ONLY
+# path that reaches the negotiation sub-graph and therefore the Financial Spend-Authority
+# Guardrail + HITL. Needed because the honest optimal pick is INTERNAL_TRANSFER, which never
+# spends and so never exercises the guardrail. Off by default → normal runs are unchanged.
+FORCE_ALT_SUPPLIER = os.environ.get("FORCE_ALT_SUPPLIER", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
-def _default_human_decision(result: SpendAuthorityResult) -> bool:
+# A human-in-the-loop decision provider: given the breach details, return True to APPROVE
+# the over-limit spend or False to REJECT it. It may be SYNC (returns bool) OR ASYNC
+# (returns an awaitable bool) — `_enforce_spend_guardrail` awaits either transparently, so
+# the Streamlit dashboard can inject a plain sync callback while the CLI stays non-blocking.
+HumanDecisionFn = Callable[[SpendAuthorityResult], Union[bool, Awaitable[bool]]]
+
+
+async def _default_human_decision(result: SpendAuthorityResult) -> bool:
     """Default HITL provider driven by HITL_MODE (cli | auto_approve | auto_reject).
 
-    Returns True to APPROVE the over-limit purchase, False to REJECT it. The CLI mode blocks
-    on operator input; the auto_* modes make deterministic choices for offline tests/CI.
+    Returns True to APPROVE the over-limit purchase, False to REJECT it. The auto_* modes
+    make deterministic choices for offline tests/CI. The CLI mode reads operator input via
+    `asyncio.to_thread(input, ...)` so the blocking terminal prompt runs on a worker thread
+    and NEVER stalls the asyncio event loop (keeps concurrent tasks / UI telemetry alive).
     """
     if HITL_MODE == "auto_approve":
         return True
     if HITL_MODE == "auto_reject":
         return False
     # Interactive CLI approval gate.
-    print("\n" + "=" * 68)
-    print("[HUMAN-IN-THE-LOOP] Spend exceeds the agent's delegated authority.")
-    print(f"  Supplier : {result.supplier_id}")
-    print(f"  Spend    : ${result.spend_usd:,.2f}")
-    print(f"  Limit    : ${result.limit_usd:,.2f}")
-    print(f"  Reason   : {result.reason}")
-    print("=" * 68)
+    prompt = (
+        "\n" + "=" * 68 + "\n"
+        "[HUMAN-IN-THE-LOOP] Spend exceeds the agent's delegated authority.\n"
+        f"  Supplier : {result.supplier_id}\n"
+        f"  Spend    : ${result.spend_usd:,.2f}\n"
+        f"  Limit    : ${result.limit_usd:,.2f}\n"
+        f"  Reason   : {result.reason}\n"
+        + "=" * 68 + "\n"
+        "Approve this purchase? [y/N]: "
+    )
     try:
-        answer = input("Approve this purchase? [y/N]: ").strip().lower()
+        # Offload blocking input() to a worker thread — does NOT block the event loop.
+        answer = (await asyncio.to_thread(input, prompt)).strip().lower()
     except EOFError:  # non-interactive stdin -> safe default is to REJECT
         return False
     return answer in ("y", "yes")
 
 
 
-class LLMUnavailableError(RuntimeError):
-    """Raised when the reasoning core is unreachable after exhausting retries.
-
-    The run loop catches this and escalates to HUMAN TAKEOVER rather than crashing
-    """
-
-
 # ---------------------------------------------------------------------------- #
 # Tool registry — the ONLY actions the Orchestrator may select each turn.
+
 # Maps the tool name the LLM emits to a concrete Python callable.
 # ---------------------------------------------------------------------------- #
 ToolFn = Callable[..., Any]
@@ -220,6 +237,7 @@ class IncidentCommander:
         order_quantity: int = ORDER_QUANTITY,
         spend_authority_limit_usd: float = SPEND_AUTHORITY_LIMIT_USD,
         human_decision: Optional[HumanDecisionFn] = None,
+        force_alt_supplier: bool = FORCE_ALT_SUPPLIER,
     ) -> None:
         self.store = store or STORE
         self._client = _init_genai_client()
@@ -229,6 +247,13 @@ class IncidentCommander:
         # the FIXED delegated authority limit — flip it to demo auto-approve vs HITL paths.
         self.order_quantity = order_quantity
         self.spend_authority_limit_usd = spend_authority_limit_usd
+        # DEMO TOGGLE (default OFF via env): when True the offline planner commits
+        # ALT_SUPPLIER regardless of scores so the spend-authority guardrail + HITL run.
+        # Scores are NOT mutated — only the terminal selection is overridden. Exposed as a
+        # constructor param (env-defaulted) so the CLI (--force-alt-supplier) and dashboard
+        # (checkbox) can flip it per-run without touching os.environ.
+        self.force_alt_supplier = force_alt_supplier
+
         # HITL decision provider (approve/reject an over-limit spend). Defaults to the
         # env-driven CLI/auto provider; the Streamlit dashboard injects its own callable.
         self.human_decision: HumanDecisionFn = human_decision or _default_human_decision
@@ -271,93 +296,22 @@ class IncidentCommander:
         return self._parse_react_text(response.text or "")
 
     async def _generate_with_retry(self, contents: str, config: Any) -> Any:
-        """Call Gemini (async) with bounded retry/backoff on transient (429 / 5xx) errors.
+        """Call Gemini via the SHARED resilient helper (`llm_utils.generate_with_retry`).
 
-        - Honors the server's suggested `retryDelay` when present (capped).
-        - Retries up to LLM_MAX_RETRIES, then raises LLMUnavailableError so the run loop
-          can escalate to HUMAN TAKEOVER instead of leaking a raw SDK traceback.
-        - A per-minute 429 typically recovers here; a daily-quota 429 will exhaust retries
-          and escalate cleanly (waiting cannot help once the daily bucket is empty).
-        - Uses `asyncio.sleep` (not time.sleep) so backoff cooperatively yields the loop.
+        The retry/backoff policy for 429/5xx (and daily-quota escalation) lives in one place
+        so the Incident Commander and the Supplier-Persona sub-graph behave identically.
         """
-        from google.genai import errors as genai_errors  # type: ignore
-
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, LLM_MAX_RETRIES + 1):
-            try:
-                return await self._client.aio.models.generate_content(  # type: ignore[union-attr]
-                    model=GEMINI_MODEL, contents=contents, config=config
-                )
-            except genai_errors.ClientError as exc:
-                last_exc = exc
-                status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-                # Only 429 (rate/quota) is worth retrying among client errors.
-                if status != 429:
-                    raise LLMUnavailableError(f"LLM client error {status}: {exc}") from exc
-                # Daily-quota 429s cannot recover by waiting seconds — retrying only burns
-                # more of the (already exhausted) free-tier budget. Escalate immediately.
-                if self._is_daily_quota_error(exc):
-                    LedgerStore.append_raw_log(
-                        "orchestrator", "LLM 429 DAILY-quota exhausted; not retrying"
-                    )
-                    raise LLMUnavailableError(
-                        f"LLM daily quota exhausted (no retry): {exc}"
-                    ) from exc
-                delay = min(self._suggested_retry_delay(exc, attempt), LLM_RETRY_CAP_SECONDS)
-                LedgerStore.append_raw_log(
-                    "orchestrator",
-                    f"LLM 429 (per-minute) attempt={attempt}/{LLM_MAX_RETRIES}; backing off {delay:.1f}s",
-                )
-                if attempt < LLM_MAX_RETRIES:
-                    await asyncio.sleep(delay)
-            except genai_errors.ServerError as exc:  # 5xx — transient server-side
-                last_exc = exc
-                delay = min(2.0 ** attempt, LLM_RETRY_CAP_SECONDS)
-                LedgerStore.append_raw_log(
-                    "orchestrator",
-                    f"LLM 5xx attempt={attempt}/{LLM_MAX_RETRIES}; backing off {delay:.1f}s",
-                )
-                if attempt < LLM_MAX_RETRIES:
-                    await asyncio.sleep(delay)
-
-        raise LLMUnavailableError(
-            f"LLM unavailable after {LLM_MAX_RETRIES} attempts: {last_exc}"
+        return await generate_with_retry(
+            self._client,
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=config,
+            source="orchestrator",
+            log=LedgerStore.append_raw_log,
         )
 
-    @staticmethod
-    def _suggested_retry_delay(exc: Any, attempt: int) -> float:
-        """Extract the server's RetryInfo.retryDelay (e.g. '34s') if present; else backoff."""
-        try:
-            details = exc.details.get("error", {}).get("details", [])  # type: ignore[attr-defined]
-            for d in details:
-                if d.get("@type", "").endswith("RetryInfo"):
-                    raw = str(d.get("retryDelay", "")).rstrip("s")
-                    return float(raw)
-        except Exception:  # pragma: no cover - fall back to exponential backoff
-            pass
-        return 2.0 ** attempt
-
-    @staticmethod
-    def _is_daily_quota_error(exc: Any) -> bool:
-        """True if a 429 is a per-DAY free-tier exhaustion (unrecoverable by waiting).
-
-        Per-day quotas carry a quotaId like 'GenerateRequestsPerDayPerProjectPerModel'.
-        Per-minute quotas ('...PerMinute...') CAN recover with a short backoff, so we only
-        skip retries for the daily kind. Detection is best-effort against the QuotaFailure
-        details, with a substring fallback on the raw message.
-        """
-        try:
-            details = exc.details.get("error", {}).get("details", [])  # type: ignore[attr-defined]
-            for d in details:
-                if d.get("@type", "").endswith("QuotaFailure"):
-                    for v in d.get("violations", []):
-                        if "PerDay" in str(v.get("quotaId", "")):
-                            return True
-        except Exception:  # pragma: no cover - fall back to message scan
-            pass
-        return "PerDay" in str(exc)
-
     def _reason_offline(self, ledger_json: str) -> Dict[str, Any]:
+
         """
         Deterministic fallback planner used when no live model is configured.
 
@@ -393,41 +347,94 @@ class IncidentCommander:
                     "thought": f"Evaluate {candidate} so I can compare options before committing.",
                     "action": {"tool": "score_strategy", "args": {"strategy_type": candidate}},
                 }
-        # 4) All scored: deliberately COMMIT the highest-composite-score strategy.
+        # 4) All scored: deliberately COMMIT the winning strategy.
         # Committing is the resolving action (the run loop treats it as terminal), so this
         # is the planner's final decision for this incident type — no separate DONE turn is
         # emitted here (that would be unreachable and waste a loop against the breaker bound).
+        # DEMO OVERRIDE: when force_alt_supplier is set, commit ALT_SUPPLIER regardless of
+        # the (untouched) scores so the negotiation + spend-authority guardrail + HITL run;
+        # otherwise pick the honest highest-composite-score strategy (INTERNAL_TRANSFER here).
+        if self.force_alt_supplier:
+            thought = (
+                f"Scores compared ({scores}); demo override forces ALT_SUPPLIER to exercise "
+                "the spend-authority guardrail — commit it."
+            )
+            return {
+                "thought": thought,
+                "action": {"tool": "commit_strategy", "args": {"strategy_type": "ALT_SUPPLIER"}},
+            }
         best = max(scores, key=lambda k: scores[k])
         return {
             "thought": f"Scores compared ({scores}); {best} is best — commit it.",
             "action": {"tool": "commit_strategy", "args": {"strategy_type": best}},
         }
 
+
     @staticmethod
-    def _parse_react_text(text: str) -> Dict[str, Any]:
+    def _extract_json_object(blob: str) -> Optional[Dict[str, Any]]:
+        """Best-effort extraction of a single JSON object from messy LLM text.
+
+        Live models often wrap the Action JSON in markdown code fences (```json ... ```),
+        add stray prose, or pretty-print across multiple lines. A naive greedy `\\{.*\\}`
+        can swallow trailing junk and fail to parse. This helper:
+          1. strips ```json / ``` fences,
+          2. finds the FIRST '{' then scans with brace-depth counting to the MATCHING '}'
+             (so it isolates exactly one balanced object, ignoring anything after it),
+          3. attempts json.loads on that balanced substring.
+        Returns the parsed dict, or None if no valid object is found.
+        """
+        # 1) Strip markdown code fences (```json ... ``` or ``` ... ```).
+        cleaned = re.sub(r"```(?:json)?", "", blob, flags=re.IGNORECASE).replace("```", "")
+
+        # 2) Brace-matching scan from the first '{'.
+        start = cleaned.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        for i in range(start, len(cleaned)):
+            ch = cleaned[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = cleaned[start : i + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        return None
+                    return cast(Dict[str, Any], parsed) if isinstance(parsed, dict) else None
+        return None
+
+
+    @classmethod
+    def _parse_react_text(cls, text: str) -> Dict[str, Any]:
         """Extract the 'Thought:' string and the JSON 'Action:' object from raw output.
 
         Thinking models (e.g. gemini-2.5-flash) often emit multi-line reasoning after the
-        'Thought:' token, so we capture everything between 'Thought:' and 'Action:' rather
-        than a single line — otherwise the thought parses as empty.
+        'Thought:' token (captured via DOTALL) and frequently wrap the Action JSON in
+        markdown code fences. We isolate the Action payload after the 'Action:' token and
+        parse it with a brace-matching, fence-tolerant extractor so valid tool calls are
+        NOT silently downgraded to DONE (which would halt the agent prematurely).
         """
         # Capture multi-line thought up to the Action token (or end of text).
         thought_match = re.search(
             r"Thought:\s*(.*?)(?=\n\s*Action:|\Z)", text, re.DOTALL | re.IGNORECASE
         )
-        action_match = re.search(
-            r"Action:\s*(\{.*\})", text, re.DOTALL | re.IGNORECASE
-        )
         thought = thought_match.group(1).strip() if thought_match else ""
+
+        # Grab everything AFTER the first 'Action:' token, then extract one JSON object
+        # from it (tolerating code fences / pretty-printing / trailing prose).
         action: Dict[str, Any] = {"tool": "DONE", "args": {}}
-        if action_match:
-            try:
-                parsed: Dict[str, Any] = json.loads(action_match.group(1))
+        action_split = re.split(r"Action:\s*", text, maxsplit=1, flags=re.IGNORECASE)
+        if len(action_split) == 2:
+            parsed = cls._extract_json_object(action_split[1])
+            if isinstance(parsed, dict) and "tool" in parsed:
+                parsed.setdefault("args", {})
                 action = parsed
-            except json.JSONDecodeError:
-                # Malformed tool syntax -> safest deterministic behavior is to stop.
-                action = {"tool": "DONE", "args": {}}
+            # else: malformed/absent tool syntax -> safe deterministic DONE.
         return {"thought": thought, "action": action}
+
 
     # ------------------------------------------------------------------ #
     # Acting: dispatch the selected tool and translate output into a ledger patch.
@@ -439,9 +446,20 @@ class IncidentCommander:
         reasonable but schema-noncompliant LLM output (e.g. strategy_type="EXPEDITE")
         becomes a recoverable error Observation instead of a downstream crash.
         """
+        # SECURITY (§5.1): sanitize EVERY dispatched tool's args (defense-in-depth), not
+        # just write actions. Any LLM-supplied string is scanned for prompt-injection /
+        # command-escape patterns + length bounds BEFORE the tool runs; a hit aborts with a
+        # recoverable error Observation (the loop continues safely).
+        try:
+            sanitize_write_payload(args)
+        except InjectionAttemptError as exc:
+            LedgerStore.append_raw_log("security", f"INJECTION_BLOCKED tool={tool} args={args} err={exc}")
+            return {"result": {"error": f"tool call blocked by security layer: {exc}"}}
+
         # Guard: reject out-of-schema strategy names up front and tell the model why.
         # Applies to BOTH evaluation (score_strategy) and selection (commit_strategy).
         if tool in ("score_strategy", "commit_strategy"):
+
             strat = str(args.get("strategy_type", ""))
             if strat not in VALID_STRATEGIES:
                 return {
@@ -455,16 +473,11 @@ class IncidentCommander:
 
         # commit_strategy is a selection action (not a computational helper): it simply
         # confirms the chosen strategy, which _mutation_for then writes to active_strategy.
-        # SECURITY (§5.1): commit_strategy is a WRITE action, so its LLM-supplied args pass
-        # through the jailbreak/injection sanitizer BEFORE anything is written. A caught
-        # pattern aborts the write and becomes a recoverable error Observation.
+        # (Its args were ALREADY sanitized by the single entry-point sweep above — no
+        # duplicate scan needed here.)
         if tool == "commit_strategy":
-            try:
-                sanitize_write_payload(args)
-            except InjectionAttemptError as exc:
-                LedgerStore.append_raw_log("security", f"INJECTION_BLOCKED commit_strategy args={args} err={exc}")
-                return {"result": {"error": f"write blocked by security layer: {exc}"}}
             return {"result": {"committed_strategy": str(args.get("strategy_type", ""))}}
+
 
 
         fn = TOOL_REGISTRY[tool]
@@ -485,13 +498,16 @@ class IncidentCommander:
         if tool == "extract_contract_rules" and result.get("found"):
             return {"context": {"contracted_penalty_rate": result["contracted_penalty_rate"]}}
         if tool == "query_shipment_tracking" and result.get("found"):
-            # A confirmed delay escalates downtime exposure. Convert the observed delay
-            # into a production-shutdown-hours primitive so state visibly progresses and
-            # downstream finance/scoring can reason over a fresher impact picture.
+            # Record ONLY the observed delay as a dedicated `delay_days` primitive.
+            # IMPORTANT (fix): do NOT overwrite `production_shutdown_hours` here — a shipment
+            # delay is NOT the same as shutdown hours; the on-hand inventory buffer absorbs
+            # part of it. `simulate_finance` remains the SOLE authority on shutdown/downtime
+            # math (it derives shutdown days from delay beyond inventory_days_remaining).
             delay_days = int(result.get("delay_days", 0))
             if delay_days > 0:
-                return {"metrics": {"production_shutdown_hours": delay_days * 24}}
+                return {"metrics": {"delay_days": delay_days}}
             return {}
+
         if tool == "simulate_finance":
             # Persist the computed financial primitives to the ledger so the single source
             # of truth captures the incident's financial exposure (not just static revenue).
@@ -600,10 +616,26 @@ class IncidentCommander:
                 write_status=False,  # orchestrator owns the shared status field
             )
 
-        results: List[TermsDict] = await asyncio.gather(*(negotiate_one(a) for a in alts))
+        # CONCURRENCY RESILIENCE (fix): pass return_exceptions=True so a single vendor
+        # sub-graph failure (timeout / dropped connection / LLM error) does NOT abort the
+        # whole gather and crash the orchestrator. Failures come back as Exception objects
+        # in the results list; we log and drop them, then proceed with whatever succeeded.
+        raw_results: List[Any] = await asyncio.gather(
+            *(negotiate_one(a) for a in alts), return_exceptions=True
+        )
+        results: List[TermsDict] = []
+        for alt, r in zip(alts, raw_results):
+            if isinstance(r, BaseException):
+                LedgerStore.append_raw_log(
+                    "orchestrator",
+                    f"negotiation ERROR supplier={alt.get('supplier_id')} err={r!r}",
+                )
+                continue
+            results.append(cast(TermsDict, r))
 
         # Keep only successful quotes.
         successful = [r for r in results if r.get("negotiation_outcome_status") == "SUCCESS"]
+
 
         # EMPTY-SEQUENCE GUARD: never call min() on an empty list.
         if len(successful) == 0:
@@ -644,9 +676,10 @@ class IncidentCommander:
         # guardrail checks whether the total spend (unit price * order quantity) is within
         # the agent's delegated authority. Over-limit spend hard-forks to a HUMAN-IN-THE-LOOP
         # approve/reject decision — the LLM has NO say in this barrier.
-        self._enforce_spend_guardrail(best, verbose)
+        await self._enforce_spend_guardrail(best, verbose)
 
-    def _enforce_spend_guardrail(self, best: TermsDict, verbose: bool) -> None:
+    async def _enforce_spend_guardrail(self, best: TermsDict, verbose: bool) -> None:
+
         """Run the spend-authority guardrail on a won deal and drive the HITL decision (§5.2).
 
         Outcomes written to the ledger:
@@ -680,11 +713,18 @@ class IncidentCommander:
         if verbose:
             print(f"[GUARDRAIL] BREACHED — {check.reason}")
 
-        approved = bool(self.human_decision(check))
+        # Obtain the human verdict. The provider may be SYNC (returns bool) or ASYNC
+        # (returns an awaitable) — await it transparently so the CLI prompt runs off the
+        # event loop while a dashboard can still inject a plain sync callback.
+        decision = self.human_decision(check)
+        if inspect.isawaitable(decision):
+            decision = await decision
+        approved = bool(decision)
         LedgerStore.append_raw_log(
             "guardrail",
             f"HITL decision approved={approved} supplier={supplier_id} spend={check.spend_usd}",
         )
+
 
         if approved:
             # Human override authorizes the over-limit purchase; the deal proceeds.
