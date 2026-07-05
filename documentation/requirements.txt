@@ -16,3 +16,5 @@ python-dotenv>=1.0.0
 # Day-4 UI dashboard that watches the State Ledger (added ahead of the dashboard build).
 streamlit>=1.30.0
 
+# Day-5 Agent CLI — cross-platform colored terminal output for the operator console.
+colorama>=0.4.6
