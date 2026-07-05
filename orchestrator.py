@@ -73,21 +73,8 @@ ORDER_QUANTITY = int(os.environ.get("ORDER_QUANTITY", "500"))
 # its own callable (Approve/Reject buttons) directly, bypassing this env switch.
 HITL_MODE = os.environ.get("HITL_MODE", "cli")
 
-# DEMO TOGGLE (default OFF): force the offline planner to COMMIT the ALT_SUPPLIER strategy
-# regardless of the recorded strategy_scores. This does NOT alter the scores themselves
-# (they stay honest at ALT_SUPPLIER 60.35 / INTERNAL_TRANSFER 80.0 / AIR_FREIGHT 65.28); it
-# only overrides the terminal SELECTION so the ALT_SUPPLIER path runs — which is the ONLY
-# path that reaches the negotiation sub-graph and therefore the Financial Spend-Authority
-# Guardrail + HITL. Needed because the honest optimal pick is INTERNAL_TRANSFER, which never
-# spends and so never exercises the guardrail. Off by default → normal runs are unchanged.
-FORCE_ALT_SUPPLIER = os.environ.get("FORCE_ALT_SUPPLIER", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
-
-
 # A human-in-the-loop decision provider: given the breach details, return True to APPROVE
+
 # the over-limit spend or False to REJECT it. It may be SYNC (returns bool) OR ASYNC
 # (returns an awaitable bool) — `_enforce_spend_guardrail` awaits either transparently, so
 # the Streamlit dashboard can inject a plain sync callback while the CLI stays non-blocking.
@@ -201,7 +188,20 @@ SEQUENCING RULES (follow this logical order):
   BEFORE calling simulate_finance — otherwise the penalty computes as 0 and is useless.
 - Only call score_strategy AFTER you understand the delay and financial exposure.
 - Choose the single best mitigation strategy, then emit DONE.
+
+FEASIBILITY RULES (a strategy must be POSSIBLE before you may commit it — this is separate
+from its score; you MUST NOT commit an infeasible option even if it scores highest):
+- INTERNAL_TRANSFER is valid ONLY if metrics.transferable_units >= metrics.replacement_order_qty
+  (both are in the ledger JSON). If PLANT-1's transferable surplus cannot cover the required
+  replacement order quantity, INTERNAL_TRANSFER is IMPOSSIBLE — do NOT commit it; escalate to
+  the next best FEASIBLE option.
+
+- AIR_FREIGHT is valid ONLY if metrics.air_freight_available is true.
+- ALT_SUPPLIER is always feasible (an approved alternate-vendor pool exists).
+This mirrors real procurement escalation: use internal stock if it suffices, else expedite,
+else source from an alternate supplier.
 {TOOL_CATALOG}
+
 ONE-SHOT FORMAT EXAMPLE (this exact two-line structure is REQUIRED every turn):
 Thought: The contract penalty rate is still 0.0, so I must parse the contract before I can simulate finance accurately.
 Action: {{"tool": "extract_contract_rules", "args": {{"contract_id": "CTR-4471"}}}}
@@ -240,7 +240,6 @@ class IncidentCommander:
         order_quantity: int = ORDER_QUANTITY,
         spend_authority_limit_usd: float = SPEND_AUTHORITY_LIMIT_USD,
         human_decision: Optional[HumanDecisionFn] = None,
-        force_alt_supplier: bool = FORCE_ALT_SUPPLIER,
     ) -> None:
         self.store = store or STORE
         self._client = _init_genai_client()
@@ -250,14 +249,8 @@ class IncidentCommander:
         # the FIXED delegated authority limit — flip it to demo auto-approve vs HITL paths.
         self.order_quantity = order_quantity
         self.spend_authority_limit_usd = spend_authority_limit_usd
-        # DEMO TOGGLE (default OFF via env): when True the offline planner commits
-        # ALT_SUPPLIER regardless of scores so the spend-authority guardrail + HITL run.
-        # Scores are NOT mutated — only the terminal selection is overridden. Exposed as a
-        # constructor param (env-defaulted) so the CLI (--force-alt-supplier) and dashboard
-        # (checkbox) can flip it per-run without touching os.environ.
-        self.force_alt_supplier = force_alt_supplier
-
         # HITL decision provider (approve/reject an over-limit spend). Defaults to the
+
         # env-driven CLI/auto provider; the Streamlit dashboard injects its own callable.
         self.human_decision: HumanDecisionFn = human_decision or _default_human_decision
 
@@ -350,27 +343,55 @@ class IncidentCommander:
                     "thought": f"Evaluate {candidate} so I can compare options before committing.",
                     "action": {"tool": "score_strategy", "args": {"strategy_type": candidate}},
                 }
-        # 4) All scored: deliberately COMMIT the winning strategy.
+        # 4) All scored: deliberately COMMIT the best *feasible* strategy.
         # Committing is the resolving action (the run loop treats it as terminal), so this
         # is the planner's final decision for this incident type — no separate DONE turn is
         # emitted here (that would be unreachable and waste a loop against the breaker bound).
-        # DEMO OVERRIDE: when force_alt_supplier is set, commit ALT_SUPPLIER regardless of
-        # the (untouched) scores so the negotiation + spend-authority guardrail + HITL run;
-        # otherwise pick the honest highest-composite-score strategy (INTERNAL_TRANSFER here).
-        if self.force_alt_supplier:
-            thought = (
-                f"Scores compared ({scores}); demo override forces ALT_SUPPLIER to exercise "
-                "the spend-authority guardrail — commit it."
-            )
-            return {
-                "thought": thought,
-                "action": {"tool": "commit_strategy", "args": {"strategy_type": "ALT_SUPPLIER"}},
-            }
-        best = max(scores, key=lambda k: scores[k])
+        #
+        # FEASIBILITY GATE (separate from the desirability scores): a strategy can only be
+        # committed if it is actually POSSIBLE this incident (e.g. INTERNAL_TRANSFER needs
+        # enough PLANT-1 surplus to cover the order; AIR_FREIGHT needs the lane available).
+        # We compare only the feasible options, so an infeasible-but-high-scoring option
+        # (e.g. INTERNAL_TRANSFER when stock is depleted) is excluded and the agent ORGANICALLY
+        # escalates to ALT_SUPPLIER — which triggers negotiation + the spend-authority
+        # guardrail + HITL. Scores stay honest and unmodified; we just don't pick the
+        # impossible one. `pool` never goes empty (ALT_SUPPLIER is always feasible).
+        feasible = {s: v for s, v in scores.items() if self._is_strategy_feasible(s, metrics)}
+        pool = feasible or scores
+        best = max(pool, key=lambda k: pool[k])
+        excluded = [s for s in scores if s not in feasible]
+        excluded_note = f" (excluded as infeasible: {', '.join(excluded)})" if excluded else ""
         return {
-            "thought": f"Scores compared ({scores}); {best} is best — commit it.",
+            "thought": f"Feasible scores compared ({feasible}){excluded_note}; {best} is best — commit it.",
             "action": {"tool": "commit_strategy", "args": {"strategy_type": best}},
         }
+
+    def _is_strategy_feasible(self, strategy: str, metrics: Dict[str, Any]) -> bool:
+        """Deterministic FEASIBILITY gate — can this strategy even be executed this incident?
+
+        This is DISTINCT from the desirability score: scoring says how *good* an option is;
+        feasibility says whether it is *possible* at all. Gating selection on feasibility is
+        how the agent realistically escalates the procurement ladder (try internal stock →
+        expedite → alternate supplier) without ever fudging the scores.
+
+        - INTERNAL_TRANSFER: feasible only if PLANT-1's transferable surplus covers the full
+          replacement order quantity (single-strategy model — no partial split).
+        - AIR_FREIGHT: feasible only if the delayed PO can actually be expedited by air.
+        - ALT_SUPPLIER: always feasible (there is an approved alternate vendor pool).
+
+        The required quantity is read from `metrics.replacement_order_qty` — the SAME value
+        serialized into the ledger JSON the LLM sees — so the model, the offline planner, and
+        this backstop all compare against ONE number (no hidden-state drift). We fall back to
+        `self.order_quantity` only if the ledger field is unset (0), keeping old callers safe.
+        """
+        if strategy == "INTERNAL_TRANSFER":
+            required = int(metrics.get("replacement_order_qty") or self.order_quantity)
+            return int(metrics.get("transferable_units", 0)) >= required
+        if strategy == "AIR_FREIGHT":
+            return bool(metrics.get("air_freight_available", True))
+        return True
+
+
 
 
     @staticmethod
@@ -479,7 +500,31 @@ class IncidentCommander:
         # (Its args were ALREADY sanitized by the single entry-point sweep above — no
         # duplicate scan needed here.)
         if tool == "commit_strategy":
-            return {"result": {"committed_strategy": str(args.get("strategy_type", ""))}}
+            strat = str(args.get("strategy_type", ""))
+            # FEASIBILITY BACKSTOP (deterministic): even though the prompt tells the LLM not
+            # to commit an infeasible strategy, we ENFORCE it in code so a live model that
+            # ignores the rule can't drive an impossible action (e.g. INTERNAL_TRANSFER when
+            # PLANT-1 has no surplus). A blocked commit becomes a recoverable error
+            # Observation, so the agent re-selects a feasible option next turn. This is what
+            # organically routes the depleted-stock scenario to ALT_SUPPLIER — live AND offline.
+            metrics = self.store.snapshot_dict().get("metrics", {})
+            if not self._is_strategy_feasible(strat, metrics):
+                LedgerStore.append_raw_log(
+                    "orchestrator", f"INFEASIBLE_COMMIT_BLOCKED strategy={strat} metrics={metrics}"
+                )
+                return {
+                    "result": {
+                        "error": (
+                            f"strategy '{strat}' is INFEASIBLE for this incident "
+                            f"(transferable_units={metrics.get('transferable_units')}, "
+                            f"air_freight_available={metrics.get('air_freight_available')}, "
+                            f"order_quantity={self.order_quantity}). "
+                            "Commit a feasible strategy instead (ALT_SUPPLIER is always feasible)."
+                        )
+                    }
+                }
+            return {"result": {"committed_strategy": strat}}
+
 
 
 
@@ -753,16 +798,27 @@ class IncidentCommander:
             return
 
         # Human rejected: cancel the purchase (no PO), keep BREACHED, escalate for manual
-        # handling. Clearing active_strategy signals no mitigation was executed.
+        # handling. Clearing active_strategy signals no mitigation was executed — AND we must
+        # also NULL the negotiated primitives. Those terms were written to the ledger the
+        # moment the vendor was selected (just before this guardrail check); leaving them
+        # would strand a phantom PO (supplier/price/lead-time) for a purchase that was
+        # explicitly cancelled, corrupting the single source of truth an ERP would poll.
         self.store.mutate(
             {
-                "mitigation": {"active_strategy": "NONE", "negotiation_status": "FAILED"},
+                "mitigation": {
+                    "active_strategy": "NONE",
+                    "negotiation_status": "FAILED",
+                    "agreed_supplier_id": None,
+                    "agreed_unit_price_usd": 0.0,
+                    "agreed_lead_time_days": 0,
+                },
                 "status": {
                     "guardrail_status": "BREACHED",
                     "escalation_reason": "human_rejected_over_limit_spend",
                 },
             }
         )
+
         if verbose:
             print(f"[HITL] REJECTED — no PO placed; incident escalated for manual handling.")
 
@@ -904,8 +960,30 @@ class IncidentCommander:
         return trace
 
 
+# Demo scenarios (feasibility presets). Selected via the SCENARIO env var; the dashboard/CLI
+# expose these as a dropdown/flag. Both use the SAME honest scores — only which mitigations
+# are POSSIBLE changes, so the agent's autonomous choice differs organically:
+#   * transfer_available    -> PLANT-1 has ample surplus; INTERNAL_TRANSFER wins (cheapest).
+#                              Demonstrates smart autonomous resolution (no spend, no HITL).
+#   * internal_options_exhausted -> PLANT-1 surplus can't cover the order AND the delayed PO
+#                              can't be air-expedited; the agent escalates to ALT_SUPPLIER →
+#                              negotiation → spend-authority guardrail → HITL.
+SCENARIOS: Dict[str, Dict[str, Any]] = {
+    "transfer_available": {"transferable_units": 900, "air_freight_available": True},
+    "internal_options_exhausted": {"transferable_units": 100, "air_freight_available": False},
+}
+
+
 async def main() -> None:
-    """Demo entry point: initialize the target incident and run the async loop."""
+    """Demo entry point: initialize the target incident and run the async loop.
+
+    The SCENARIO env var picks the feasibility preset (default `transfer_available`, which
+    resolves via INTERNAL_TRANSFER). Set `SCENARIO=internal_options_exhausted` to demo the
+    ALT_SUPPLIER negotiation + spend-authority guardrail + HITL path.
+    """
+    scenario_name = os.environ.get("SCENARIO", "transfer_available")
+    scenario = SCENARIOS.get(scenario_name, SCENARIOS["transfer_available"])
+
     STORE.init_incident(
         target_sku="SKU-99",
         primary_supplier_id="SUP-A",
@@ -915,13 +993,22 @@ async def main() -> None:
         inventory_days_remaining=2,
         production_shutdown_hours=48,
         revenue_at_risk_usd=4200.0,
+        transferable_units=scenario["transferable_units"],
+        air_freight_available=scenario["air_freight_available"],
+        # Seed the ledger-visible replacement quantity from the SAME value the commander
+        # uses for spend, so the LLM's feasibility check and the guardrail's spend math read
+        # one consistent number (no hidden-state drift).
+        replacement_order_qty=ORDER_QUANTITY,
     )
     commander = IncidentCommander()
+
     mode = "LLM (Gemini)" if commander.llm_enabled else "OFFLINE deterministic planner"
     print(f"Incident Commander reasoning core: {mode} | model={GEMINI_MODEL}")
+    print(f"Scenario: {scenario_name} ({scenario})")
     await commander.run()
     print("\nFinal ledger:")
     print(STORE.snapshot().model_dump_json(indent=2))
+
 
 
 if __name__ == "__main__":

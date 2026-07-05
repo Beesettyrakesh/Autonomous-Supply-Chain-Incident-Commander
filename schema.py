@@ -54,6 +54,24 @@ class ImpactMetrics(BaseModel):
     production_shutdown_hours: int
     # Guarded value: the Financial Spend Guardrail hard-forks to HUMAN TAKEOVER if this > 5000.00.
     revenue_at_risk_usd: float
+    # --- Mitigation FEASIBILITY signals (single source of truth for which options are even
+    # possible this incident). These gate strategy SELECTION deterministically — separate from
+    # the desirability SCORES in score_strategy. Populated at init from the incident scenario.
+    #   * transferable_units: surplus PLANT-1 can move to PLANT-2. INTERNAL_TRANSFER is only
+    #     feasible when this covers the required order quantity.
+    #   * air_freight_available: whether the delayed PO can be expedited by air on this lane.
+    # Default scenario = both viable (INTERNAL_TRANSFER wins). "internal_options_exhausted"
+    # zeroes them so the agent must organically escalate to ALT_SUPPLIER (negotiation + the
+    # spend-authority guardrail + HITL).
+    transferable_units: int = 900
+    air_freight_available: bool = True
+    # The replacement order quantity this incident must cover — the SAME value the spend
+    # guardrail multiplies by unit price. Held on the ledger (not just in the orchestrator)
+    # so the LLM can read it and apply the INTERNAL_TRANSFER feasibility rule
+    # (transferable_units >= replacement_order_qty) instead of guessing.
+    replacement_order_qty: int = 0
+
+
     # Observed shipment delay (days) written by query_shipment_tracking. This is the RAW
     # observation; simulate_finance is the SOLE authority that converts it into downtime
     # (only the delay days BEYOND inventory_days_remaining incur shutdown). Kept separate

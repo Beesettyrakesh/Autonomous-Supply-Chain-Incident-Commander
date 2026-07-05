@@ -19,12 +19,16 @@ Guarantees provided here:
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, cast
 from uuid import UUID, uuid4
+
+
 
 from schema import (
     StateLedger,
@@ -37,6 +41,17 @@ from schema import (
 
 # Isolated raw-detail sink. The Orchestrator cannot read this natively (Section 3.2).
 RAW_LOG_PATH = Path(__file__).parent / "incident_execution.log"
+
+# Control characters that must NEVER reach the flat audit log verbatim. Adversarial input
+# (e.g. an injection blob, a poisoned vendor reply) could otherwise embed carriage returns /
+# line feeds (\r \n) to FORGE fake log lines, or ANSI/ESC sequences to hide/rewrite terminal
+# output when the log is `cat`-ed. We neutralize ALL C0 control bytes (0x00-0x1f — this
+# INCLUDES tab, CR, LF and ESC) plus DEL (0x7f) at the single write boundary, so every call
+# site is protected (log-forging defense, §5.1). The record's only newline is the trailing
+# "\n" the writer appends itself.
+_LOG_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
 
 
 class LedgerStore:
@@ -69,13 +84,23 @@ class LedgerStore:
         inventory_days_remaining: int = 0,
         production_shutdown_hours: int = 0,
         revenue_at_risk_usd: float = 0.0,
+        transferable_units: int = 900,
+        air_freight_available: bool = True,
+        replacement_order_qty: int = 0,
         incident_type: str = "SUPPLIER_DELAY",
+
         severity: str = "CRITICAL",
         incident_id: Optional[UUID] = None,
     ) -> StateLedger:
         """
         Corresponds to the INIT STATE LEDGER node: sets IDs, SKUs, and LoopCount=0.
         Returns the freshly created, validated ledger.
+
+        `transferable_units` and `air_freight_available` seed the mitigation FEASIBILITY
+        signals (which options are even possible this incident) — these gate strategy
+        SELECTION deterministically, independent of the desirability scores. The default
+        scenario keeps INTERNAL_TRANSFER viable; a depleted scenario zeroes them so the
+        agent must organically escalate to ALT_SUPPLIER (negotiation + guardrail + HITL).
         """
         with self._lock:
             ledger = StateLedger(
@@ -96,10 +121,15 @@ class LedgerStore:
                     inventory_days_remaining=inventory_days_remaining,
                     production_shutdown_hours=production_shutdown_hours,
                     revenue_at_risk_usd=revenue_at_risk_usd,
+                    transferable_units=transferable_units,
+                    air_freight_available=air_freight_available,
+                    replacement_order_qty=replacement_order_qty,
                 ),
+
                 mitigation=MitigationState(),
                 status=SystemStatus(),
             )
+
             self._ledger = ledger
             self._revision = 0
             self._notify()
@@ -169,14 +199,38 @@ class LedgerStore:
         """
         Append verbose / unstructured tool output to the isolated execution log.
         The Orchestrator cannot read this natively; only an explicit lookup tool may.
+
+        SECURITY (log-forging defense, §5.1): both `source` and `raw_payload` may carry
+        adversarial content (LLM output, vendor replies, blocked injection blobs). We strip
+        embedded control characters — CR/LF (which would forge extra log lines) and ANSI/ESC
+        sequences (which would corrupt terminal rendering) — BEFORE writing. This is the
+        single write boundary, so EVERY call site is protected here (not per-f-string). The
+        record still occupies exactly one line; the trailing "\\n" is the only newline.
         """
         timestamp = datetime.now(timezone.utc).isoformat()
+        safe_source = _LOG_CONTROL_CHARS_RE.sub(" ", str(source))
+        safe_payload = _LOG_CONTROL_CHARS_RE.sub(" ", str(raw_payload))
         with RAW_LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(f"[{timestamp}] [{source}] {raw_payload}\n")
+            fh.write(f"[{timestamp}] [{safe_source}] {safe_payload}\n")
+
+    @staticmethod
+    async def append_raw_log_async(source: str, raw_payload: str) -> None:
+        """Non-blocking variant of `append_raw_log` for use inside async coroutines.
+
+        The synchronous `append_raw_log` does a blocking file write. Called from within the
+        concurrent negotiation sub-graphs (multiple vendors under `asyncio.gather`), a raw
+        blocking write would briefly stall the event loop and serialize otherwise-concurrent
+        LLM network calls. This wrapper offloads the write to a worker thread via
+        `asyncio.to_thread`, keeping the loop free so simultaneous vendor calls stay truly
+        concurrent. Same control-char sanitization applies (it reuses `append_raw_log`).
+        """
+        await asyncio.to_thread(LedgerStore.append_raw_log, source, raw_payload)
+
 
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
+
     def _notify(self) -> None:
         if self.on_mutation is not None and self._ledger is not None:
             # Hand watchers a deep copy so they cannot corrupt canonical state.

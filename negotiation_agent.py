@@ -32,6 +32,9 @@ from typing import Any, Callable, Dict, Optional
 
 from ledger_store import STORE, LedgerStore
 from llm_utils import generate_with_retry
+from guardrails import sanitize_write_payload, InjectionAttemptError, MAX_NL_STRING_LEN
+
+
 
 
 # Scalar-only terms map. Nested objects are forbidden — every value must be a primitive.
@@ -248,19 +251,41 @@ async def run_supplier_negotiation(
             min(price_ceiling, opening_offer + (price_ceiling - opening_offer) * (turn - 1) / max(1, MAX_TURNS - 1)),
             2,
         )
-        LedgerStore.append_raw_log(
+        # Async (non-blocking) log write — inside the concurrent gather, a sync file write
+        # would stall the event loop and serialize the vendors' LLM calls (see
+        # LedgerStore.append_raw_log_async).
+        await LedgerStore.append_raw_log_async(
             "negotiation_turn",
             f"incident_id={incident_id} supplier={supplier_id} turn={turn} buyer_offer={offer_price}",
         )
 
         raw_reply = await _vendor_reply(offer_price, qty, turn, floor_price, lead_time_days)
         # Route the messy raw dialogue to the isolated log — never into the ledger.
-        LedgerStore.append_raw_log(
+        await LedgerStore.append_raw_log_async(
             "negotiation_vendor_reply",
             f"incident_id={incident_id} supplier={supplier_id} turn={turn} raw={raw_reply!r}",
         )
 
+        # SECURITY (defense-in-depth at the REAL injection surface, §5.1): the vendor's raw
+        # NL reply is untrusted secondary-LLM output. Scan it BEFORE parsing. A hit is
+        # non-crashing — we log it and treat this turn as a REJECT (skip to next volley),
+        # so a malicious reply can neither drive parsing nor taint the ledger. (The parsed
+        # `outcome` is scanned again below as a second layer.)
+        try:
+            # NL text -> use the looser natural-language length bound so a benign one-or-two
+            # sentence reply isn't rejected on length; injection-pattern regex still applies.
+            sanitize_write_payload({"raw_reply": raw_reply}, max_len=MAX_NL_STRING_LEN)
+        except InjectionAttemptError as exc:
+
+            await LedgerStore.append_raw_log_async(
+                "negotiation_vendor_reply",
+                f"RAW_REPLY_BLOCKED incident_id={incident_id} supplier={supplier_id} turn={turn} err={exc}",
+            )
+            await asyncio.sleep(0)
+            continue
+
         parsed = _parse_vendor_reply(raw_reply, fallback_price=offer_price, fallback_qty=qty)
+
 
         if parsed["vendor_decision"] == "ACCEPT":
             outcome = {
@@ -290,9 +315,32 @@ async def run_supplier_negotiation(
         # Cooperative yield so this is genuinely async (lets the event loop breathe).
         await asyncio.sleep(0)
 
+    # SECURITY (defense-in-depth at the multi-agent boundary, §5.1): the outcome is derived
+    # from an UNTRUSTED secondary LLM (the Supplier-Persona). Even though we parse it to
+    # strict primitives, scan the whole outcome for injection/escape patterns BEFORE it can
+    # flow back to the orchestrator and into STORE.mutate. A hit does NOT crash the vendor's
+    # coroutine — we downgrade this vendor to a FAILED negotiation (log + drop), consistent
+    # with the orchestrator's return_exceptions=True resilience, so a single poisoned reply
+    # can never taint the ledger nor abort the concurrent gather.
+    try:
+        sanitize_write_payload(outcome)
+    except InjectionAttemptError as exc:
+        LedgerStore.append_raw_log(
+            "run_supplier_negotiation",
+            f"OUTCOME_BLOCKED incident_id={incident_id} supplier={supplier_id} err={exc}",
+        )
+        outcome = {
+            "negotiation_outcome_status": "FAILED",
+            "agreed_supplier_id": supplier_id,
+            "agreed_unit_price_usd": 0.0,
+            "agreed_lead_time_days": 0,
+            "agreed_qty": qty,
+        }
+
     # Forced resolution: commit the primitive status ONLY when we own the lock. Under a
     # concurrent gather the orchestrator writes the single final status after picking best.
     final_status = str(outcome["negotiation_outcome_status"])
+
     if write_status:
         active_store.mutate({"mitigation": {"negotiation_status": final_status}})
     LedgerStore.append_raw_log(

@@ -126,9 +126,19 @@ class InjectionAttemptError(ValueError):
     """
 
 
-# Maximum accepted length for any single string parameter destined for a write action.
-# Legitimate primitives (strategy names, supplier ids) are short; long blobs are suspect.
+# Maximum accepted length for a system-identifier string destined for a write action
+# (strategy names, supplier ids, tool args). These are short by design, so a long blob here
+# is inherently suspect — keep the bound tight.
 MAX_WRITE_STRING_LEN = 100
+
+# Separate, looser bound for legitimate NATURAL-LANGUAGE fields (e.g. a Supplier-Persona's
+# raw reply, which is "one or two short sentences"). Two real sentences routinely exceed 100
+# chars, so scanning them with the strict identifier bound would false-positive and reject
+# benign live replies. Callers pass this via `max_len` ONLY for genuine NL text; the regex
+# injection patterns still apply, so real prompt-injection payloads are blocked regardless
+# of length.
+MAX_NL_STRING_LEN = 500
+
 
 # Patterns that should NEVER appear in a legitimate write parameter. These target common
 # prompt-injection / command-injection / escape techniques rather than business values.
@@ -145,11 +155,16 @@ _INJECTION_PATTERNS = (
 )
 
 
-def _scan_string(value: str, field: str) -> None:
-    """Raise InjectionAttemptError if `value` is over-length or matches an injection pattern."""
-    if len(value) > MAX_WRITE_STRING_LEN:
+def _scan_string(value: str, field: str, max_len: int = MAX_WRITE_STRING_LEN) -> None:
+    """Raise InjectionAttemptError if `value` is over-length or matches an injection pattern.
+
+    `max_len` defaults to the strict identifier bound; NL callers pass MAX_NL_STRING_LEN.
+    The injection-pattern regex scan ALWAYS runs regardless of the length bound, so a longer
+    allowance never weakens payload-content detection.
+    """
+    if len(value) > max_len:
         raise InjectionAttemptError(
-            f"field '{field}' exceeds max length {MAX_WRITE_STRING_LEN} "
+            f"field '{field}' exceeds max length {max_len} "
             f"({len(value)} chars) — write aborted"
         )
     for pattern in _INJECTION_PATTERNS:
@@ -159,7 +174,7 @@ def _scan_string(value: str, field: str) -> None:
             )
 
 
-def _sanitize_value(field: str, value: Any) -> None:
+def _sanitize_value(field: str, value: Any, max_len: int = MAX_WRITE_STRING_LEN) -> None:
     """Recursively scan a single value of ANY shape for injection/escape patterns (§5.1).
 
     Strings are scanned directly; dicts recurse over their values (and stringified keys);
@@ -167,21 +182,28 @@ def _sanitize_value(field: str, value: Any) -> None:
     inert and pass through untouched. Handling lists is critical: an attacker could smuggle a
     prompt-override as a list element (e.g. {"x": ["ignore all previous instructions"]}) — a
     string-and-dict-only scanner would silently miss it. This closes that bypass.
+
+    `max_len` (default = strict identifier bound) applies to every string scanned in this
+    subtree; NL callers pass MAX_NL_STRING_LEN so conversational text isn't false-flagged on
+    length alone. Dict KEYS keep the strict identifier bound regardless (keys are never NL).
     """
     if isinstance(value, str):
-        _scan_string(value, field)
+        _scan_string(value, field, max_len)
     elif isinstance(value, dict):
         for k, v in cast(Dict[Any, Any], value).items():
-            # A malicious KEY is as dangerous as a malicious value — scan both.
+            # A malicious KEY is as dangerous as a malicious value — scan both. Keys are
+            # identifiers, so they always use the strict default bound.
             _scan_string(str(k), f"{field}.<key>")
-            _sanitize_value(f"{field}.{k}", v)
+            _sanitize_value(f"{field}.{k}", v, max_len)
     elif isinstance(value, (list, tuple)):
         for i, item in enumerate(cast(Any, value)):
-            _sanitize_value(f"{field}[{i}]", item)
+            _sanitize_value(f"{field}[{i}]", item, max_len)
     # else: inert scalar (int/float/bool/None) — nothing to scan.
 
 
-def sanitize_write_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def sanitize_write_payload(
+    payload: Dict[str, Any], max_len: int = MAX_WRITE_STRING_LEN
+) -> Dict[str, Any]:
     """
     Scan every value in a write-bound payload for injection/escape patterns and
     length-boundary violations BEFORE it is allowed to mutate the ledger (§5.1).
@@ -193,15 +215,21 @@ def sanitize_write_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     Args:
         payload: The dict of parameters destined for a write/commit action.
+        max_len: Per-string length bound. Defaults to the strict identifier bound
+            (MAX_WRITE_STRING_LEN=100). Pass MAX_NL_STRING_LEN for genuine natural-language
+            fields (e.g. a vendor's raw reply) so benign multi-sentence text isn't rejected
+            on length — the injection-pattern regex still applies either way.
 
     Returns:
         The same payload unchanged if it is clean (so callers can inline the call).
     """
     for key, value in payload.items():
+        # Top-level keys are identifiers -> strict default bound.
         _scan_string(str(key), "<key>")
-        _sanitize_value(str(key), value)
+        _sanitize_value(str(key), value, max_len)
 
     return payload
+
 
 
 
@@ -211,5 +239,7 @@ __all__ = [
     "check_spend_authority",
     "InjectionAttemptError",
     "MAX_WRITE_STRING_LEN",
+    "MAX_NL_STRING_LEN",
     "sanitize_write_payload",
 ]
+
