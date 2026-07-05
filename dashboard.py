@@ -180,8 +180,12 @@ class AgentSession:
     events: List[EventTuple] = field(default_factory=list)
     # Which reasoning core actually engaged this run ("LIVE · <model>" or "OFFLINE …").
     core_mode: str = ""
+    # The scenario key the currently-displayed run used — so the UI can auto-clear a stale
+    # flow when the operator picks a different scenario without pressing Reset first.
+    run_scenario: str = ""
     # Last STORE revision the UI observed — used by the stale-snapshot convergence guard.
     last_revision: int = -1
+
 
 
 def _on_event(sess: AgentSession):
@@ -304,10 +308,15 @@ def _start(sess: AgentSession, params: Dict[str, Any]) -> None:
         replacement_order_qty=params["order_quantity"],
     )
 
+    # Remember which scenario this run is for, so the UI can auto-clear a stale flow if the
+    # operator later picks a different scenario without pressing Reset.
+    sess.run_scenario = str(params["scenario"])
+
     sess.running = True
     sess.started = True
     sess.thread = threading.Thread(target=_run_agent, args=(sess, params), daemon=True)
     sess.thread.start()
+
 
 
 
@@ -581,7 +590,16 @@ def main() -> None:
             "(uses your API quota). Default ON to protect the free tier.",
             disabled=sess.running,
         )
-        scenario_label = st.radio(
+        # Live-mode requires a Gemini API key. Surface that requirement inline the moment the
+        # operator turns Offline OFF, so it's obvious a key must be present in the .env — and
+        # that the run gracefully falls back to the deterministic planner if it's missing.
+        if not offline:
+            st.info(
+                "Live mode uses Google Gemini and requires `GEMINI_API_KEY` in your `.env`. "
+                "Without it, the run automatically falls back to the deterministic planner."
+            )
+
+        scenario_label = st.selectbox(
             "Scenario",
             options=[label for label, _key in _SCENARIO_CHOICES],
             index=0,
@@ -602,14 +620,14 @@ def main() -> None:
             "exceeds the $20k limit and triggers human review.",
             disabled=sess.running,
         )
-        spend_limit = st.number_input(
-            "Spend-authority limit ($)",
-            min_value=0.0,
-            value=float(SPEND_AUTHORITY_LIMIT_USD),
-            step=1000.0,
-            help="The agent's delegated signing authority. Spend above this escalates to a "
-            "human.",
-            disabled=sess.running,
+
+        # The spend-authority limit is a FIXED delegated signing authority — in a real
+        # enterprise it's set by senior management and locked, not re-tuned per incident. So
+        # we display it as a read-only notice rather than an editable field; the constant is
+        # passed straight through to the agent.
+        st.caption(
+            f"Spend authority: **${SPEND_AUTHORITY_LIMIT_USD:,.0f}** — fixed delegated limit; "
+            "spend above this escalates to a human."
         )
 
         col_a, col_b = st.columns(2)
@@ -620,7 +638,7 @@ def main() -> None:
                     "offline": offline,
                     "scenario": scenario,
                     "order_quantity": int(order_quantity),
-                    "spend_limit": float(spend_limit),
+                    "spend_limit": float(SPEND_AUTHORITY_LIMIT_USD),
                     "gemini_key": original_key,
                 },
             )
@@ -633,7 +651,17 @@ def main() -> None:
         if not offline and not original_key:
             st.warning("No API key found — a live run will fall back to the offline planner.")
 
+    # AUTO-CLEAR STALE FLOW: if a previous run is displayed (started, not running) and the
+    # operator selects a DIFFERENT scenario without pressing Reset, wipe the old flow so the
+    # UI cleanly returns to the "press Start" state for the new scenario — otherwise the old
+    # run's cards/chat linger and visually fight the next run. Only fires between runs (the
+    # scenario control is disabled while running), so it's safe.
+    if sess.started and not sess.running and not _thread_alive(sess) and scenario != sess.run_scenario:
+        _reset(sess)
+        st.rerun()
+
     # ------------------------------- Header -------------------------------------------- #
+
     st.title("Autonomous Supply Chain Incident Commander")
     st.caption(
         "An autonomous, incident-triggered agent that reasons over a structured state "
