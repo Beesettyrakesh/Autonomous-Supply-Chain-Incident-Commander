@@ -12,3 +12,7 @@ google-genai>=1.0.0
 
 # Loads GEMINI_API_KEY / GEMINI_MODEL from a local .env file (keeps secrets out of code).
 python-dotenv>=1.0.0
+
+# Day-4 UI dashboard that watches the State Ledger (added ahead of the dashboard build).
+streamlit>=1.30.0
+
