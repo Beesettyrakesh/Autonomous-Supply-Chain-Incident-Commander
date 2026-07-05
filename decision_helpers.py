@@ -38,7 +38,11 @@ class StrategyScoreResult(TypedDict):
     composite_score: float
 
 
-def simulate_finance(delay_days: Optional[int], state_ledger_snapshot: Dict[str, Any]) -> FinanceSimulationResult:
+def simulate_finance(
+    delay_days: Optional[int] = None,
+    state_ledger_snapshot: Optional[Dict[str, Any]] = None,
+) -> FinanceSimulationResult:
+
     """
     Calculate concrete cash-flow impact and downtime penalty parameters.
 
@@ -68,9 +72,13 @@ def simulate_finance(delay_days: Optional[int], state_ledger_snapshot: Dict[str,
       per day is derived from the ledger's `production_shutdown_hours` (hours of lost output
       the incident represents) valued at the same revenue exposure basis.
     """
-    metrics = state_ledger_snapshot.get("metrics", {})
-    context = state_ledger_snapshot.get("context", {})
+    # Default both params so an LLM turn that omits them can't raise TypeError and crash
+    # the ReAct loop; an absent snapshot degrades safely to zeros rather than exploding.
+    snapshot = state_ledger_snapshot or {}
+    metrics = snapshot.get("metrics", {})
+    context = snapshot.get("context", {})
     revenue_at_risk = float(metrics.get("revenue_at_risk_usd", 0.0))
+
     # Contract-derived rate replaces any hardcoded coefficient.
     contracted_penalty_rate = float(context.get("contracted_penalty_rate", 0.0))
     inventory_days_remaining = int(metrics.get("inventory_days_remaining", 0))

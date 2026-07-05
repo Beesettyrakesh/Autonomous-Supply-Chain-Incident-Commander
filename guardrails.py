@@ -159,14 +159,37 @@ def _scan_string(value: str, field: str) -> None:
             )
 
 
+def _sanitize_value(field: str, value: Any) -> None:
+    """Recursively scan a single value of ANY shape for injection/escape patterns (§5.1).
+
+    Strings are scanned directly; dicts recurse over their values (and stringified keys);
+    lists/tuples recurse over their elements. Non-string scalars (numbers, bools, None) are
+    inert and pass through untouched. Handling lists is critical: an attacker could smuggle a
+    prompt-override as a list element (e.g. {"x": ["ignore all previous instructions"]}) — a
+    string-and-dict-only scanner would silently miss it. This closes that bypass.
+    """
+    if isinstance(value, str):
+        _scan_string(value, field)
+    elif isinstance(value, dict):
+        for k, v in cast(Dict[Any, Any], value).items():
+            # A malicious KEY is as dangerous as a malicious value — scan both.
+            _scan_string(str(k), f"{field}.<key>")
+            _sanitize_value(f"{field}.{k}", v)
+    elif isinstance(value, (list, tuple)):
+        for i, item in enumerate(cast(Any, value)):
+            _sanitize_value(f"{field}[{i}]", item)
+    # else: inert scalar (int/float/bool/None) — nothing to scan.
+
+
 def sanitize_write_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Scan every string value in a write-bound payload for injection/escape patterns and
+    Scan every value in a write-bound payload for injection/escape patterns and
     length-boundary violations BEFORE it is allowed to mutate the ledger (§5.1).
 
-    Non-string primitives (numbers, bools) are passed through untouched; nested dicts are
-    scanned recursively. On any violation an InjectionAttemptError is raised so the caller
-    aborts the write and cancels the transaction.
+    Handles arbitrarily-nested structures via `_sanitize_value`: strings, dicts (values AND
+    keys), and LISTS/tuples are all traversed; non-string scalars pass through untouched. On
+    any violation an InjectionAttemptError is raised so the caller aborts the write and
+    cancels the transaction.
 
     Args:
         payload: The dict of parameters destined for a write/commit action.
@@ -175,13 +198,11 @@ def sanitize_write_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         The same payload unchanged if it is clean (so callers can inline the call).
     """
     for key, value in payload.items():
-        if isinstance(value, str):
-            _scan_string(value, key)
-        elif isinstance(value, dict):
-            # recurse into nested payloads; raises on any nested violation
-            sanitize_write_payload(cast(Dict[str, Any], value))
+        _scan_string(str(key), "<key>")
+        _sanitize_value(str(key), value)
 
     return payload
+
 
 
 __all__ = [

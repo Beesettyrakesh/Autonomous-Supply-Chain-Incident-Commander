@@ -165,6 +165,9 @@ AVAILABLE TOOLS (select exactly one per turn):
 - query_shipment_tracking(po_id: str)       -> transit status, updated ETA, delay_days
 - extract_contract_rules(contract_id: str)  -> contracted_penalty_rate from the contract
 - simulate_finance(delay_days: int)         -> daily penalty + projected total loss
+      pass the delay observed via query_shipment_tracking (call that FIRST so the
+      loss reflects the real slip; omitting it falls back to the ledger's delay_days)
+
 - score_strategy(strategy_type: str)        -> cost/time/risk + composite score (EVALUATE only)
       strategy_type MUST be exactly one of: {", ".join(VALID_STRATEGIES)}
       (do NOT invent other values such as "EXPEDITE" — use "AIR_FREIGHT" to expedite)
@@ -484,8 +487,17 @@ class IncidentCommander:
         # Decision Helpers that reason over full state receive the live snapshot.
         if tool in ("simulate_finance", "score_strategy"):
             args = {**args, "state_ledger_snapshot": self.store.snapshot_dict()}
-        result = fn(**args)
+        # RESILIENCE: a live LLM can emit missing/extra/mistyped args for any tool. Guard the
+        # call so a bad signature (e.g. omitting a required arg) becomes a recoverable error
+        # Observation instead of crashing the ReAct loop — same philosophy as the mutation
+        # ValidationError net and the strategy/injection guards above.
+        try:
+            result = fn(**args)
+        except TypeError as exc:
+            LedgerStore.append_raw_log("orchestrator", f"BAD_TOOL_ARGS tool={tool} args={args} err={exc}")
+            return {"result": {"error": f"invalid arguments for '{tool}': {exc}"}}
         return {"result": result}
+
 
     def _mutation_for(self, tool: str, output: Dict[str, Any]) -> Dict[str, Any]:
         """Map a tool's parsed output to a validated State Ledger patch (Mutation Layer)."""
