@@ -116,6 +116,24 @@ def _md(text: str) -> str:
     return text.replace("$", "\\$")
 
 
+# Inline "green circle with a white check" badge — a real filled circle (border-radius 50%)
+# with a centered ✓, rendered via HTML so we control the exact look (st.status can only show
+# its own flat glyph). Prepended to every COMPLETED step/negotiation header. Kept tiny and
+# vertically-aligned so it sits neatly before the title text.
+_DONE_BADGE = (
+    "<span style='display:inline-flex;align-items:center;justify-content:center;"
+    "width:1.15em;height:1.15em;border-radius:50%;background:#22c55e;color:#fff;"
+    "font-size:0.8em;font-weight:700;line-height:1;vertical-align:middle;"
+    "margin-right:0.45em;'>✓</span>"
+)
+
+
+def _done_header(title: str) -> str:
+    """A completed-step header: green-circle-check badge + bold title (HTML, `$` escaped)."""
+    return f"{_DONE_BADGE}<b>{_md(title)}</b>"
+
+
+
 # --------------------------------------------------------------------------- #
 # Async HITL bridge — the safe cross-thread pause/resume for the guardrail.
 # --------------------------------------------------------------------------- #
@@ -186,6 +204,12 @@ class AgentSession:
     run_params: Tuple[int, int] = (0, 0)
     # Last STORE revision the UI observed — used by the stale-snapshot convergence guard.
     last_revision: int = -1
+    # Latched terminal outcome ("resolved" | "escalated"), set EXACTLY ONCE from the
+    # orchestrator's final resolution event when the run settles. Monotonic: once set it never
+    # flips, so the vitals + Zone-3 label can never flicker between Escalated and Resolved
+    # during the brief post-HITL settling window (the earlier bug). None until settled.
+    outcome: Optional[str] = None
+
 
 
 
@@ -338,7 +362,7 @@ def _thread_alive(sess: AgentSession) -> bool:
 # --------------------------------------------------------------------------- #
 # Zone renderers
 # --------------------------------------------------------------------------- #
-def _render_vitals(ledger: Any, running: bool) -> None:
+def _render_vitals(ledger: Any, running: bool, outcome: Optional[str]) -> None:
     """Zone 1 — the business vitals strip. Reads the live ledger (single source of truth).
 
     Deliberately shows BUSINESS metrics only (loss / revenue / status). The internal ReAct
@@ -346,18 +370,21 @@ def _render_vitals(ledger: Any, running: bool) -> None:
     agent's internal iteration mechanics.
     """
     metrics = ledger.metrics
-    status = ledger.status
 
-    if status.guardrail_status == "BREACHED":
+    # Status is derived from the LATCHED `outcome` (set once when the run settles), NEVER
+    # re-derived from the live ledger — that is what killed the Escalated↔Resolved flicker:
+    # while running we show "In progress"; once settled we show the single, monotonic terminal
+    # label. `outcome` can only ever be set to one value for a given run, so it cannot flip.
+    if running or outcome is None:
+        status_label = "In progress" if running else "Standby"
+        status_help = "Agent is working the incident" if running else "Awaiting dispatch"
+    elif outcome == "escalated":
         status_label, status_help = "Escalated", "Guardrail breached — handed to a human"
-    elif status.goal_achieved:
+    else:  # "resolved"
         status_label, status_help = "Resolved", "Incident mitigated autonomously"
-    elif running:
-        status_label, status_help = "In progress", "Agent is working the incident"
-    else:
-        status_label, status_help = "Standby", "Awaiting dispatch"
 
     c1, c2, c3 = st.columns(3)
+
     c1.metric("Projected Loss", f"${metrics.projected_total_loss_usd:,.0f}")
     c2.metric("Revenue at Risk", f"${metrics.revenue_at_risk_usd:,.0f}")
     c3.metric("Status", status_label, help=status_help)
@@ -383,21 +410,19 @@ def _action_text(message: str, data: Dict[str, Any]) -> str:
 
 
 
-def _render_react_card(steps: List[EventTuple], is_last: bool, running: bool) -> None:
-    """Render one grouped ReAct turn (Reasoning → Action → Finding) as a single status card.
+def _render_react_card(steps: List[EventTuple]) -> None:
+    """Render one COMPLETED ReAct turn (Reasoning → Action → Finding) as a static block.
 
-    The card shows a SPINNER while its turn is still the active one (agent running and this is
-    the latest, not-yet-finished group); once the Finding has arrived — or the run has ended —
-    it flips to a COMPLETE (green check) state. This gives the judge a clear per-step
-    "processing → done" cue. In OFFLINE mode the run finishes almost instantly so most cards
-    render already-complete; in LIVE mode the real model latency makes the spinner meaningful.
+    DESIGN (why NOT st.status): st.status widgets re-mount on every one of our ~0.4s
+    auto-reruns, which restarts their spinner and causes visible flicker; their label is also
+    plain text, so we can't render a custom green-circle tick inside it. Instead we render a
+    STATIC header — a green-circle-white-check badge (`_done_header`) + the step title — with
+    the Reasoning / Action / Finding detail tucked into a COLLAPSED `st.expander`. Static
+    markdown + a plain expander don't re-mount/animate on reruns, so there is ZERO flicker,
+    and the tick is exactly the circled green check requested. The single live "reasoning…"
+    spinner (shown separately at the tail of the log while the thread is alive) is the honest
+    in-progress indicator — the real LLM latency happens BETWEEN cards, not within one.
     """
-    kinds = {k for k, _m, _d in steps}
-    has_finding = "observation" in kinds
-    # A card is still "running" only if the agent is live, this is the tail group, and its
-    # Finding hasn't landed yet.
-    in_progress = running and is_last and not has_finding
-
     # Card title = the tool/action purpose if known, else a generic "Reasoning step".
     title = "Reasoning step"
     for k, m, d in steps:
@@ -406,8 +431,8 @@ def _render_react_card(steps: List[EventTuple], is_last: bool, running: bool) ->
             title = _TOOL_PURPOSE.get(tool, f"Calling {tool}")
             break
 
-    state = "running" if in_progress else "complete"
-    with st.status(title, state=state, expanded=True):
+    st.markdown(_done_header(title), unsafe_allow_html=True)
+    with st.expander("Details", expanded=False):
         for k, m, d in steps:
             if k == "thought":
                 st.markdown(f"**Reasoning** — {_md(_thought_text(m))}")
@@ -419,27 +444,70 @@ def _render_react_card(steps: List[EventTuple], is_last: bool, running: bool) ->
                     st.markdown(f"**Finding** — {_md(body)}")
 
 
-def _render_negotiation(steps: List[EventTuple]) -> None:
-    """Render the supplier negotiation as a chat between the buyer agent and the suppliers.
 
-    Uses `st.chat_message` bubbles: the buyer (our agent) on one side, each supplier on the
-    other, and system lines (opening the bidding / best quote secured) as plain notices. The
-    numbers are the REAL negotiated terms surfaced by the orchestrator — this is a faithful,
-    sequential reconstruction of a concurrently-run negotiation, purely for presentation.
+def _render_negotiation(steps: List[EventTuple], is_last: bool, running: bool) -> None:
+    """Render the supplier negotiation block (same static treatment as the ReAct cards).
+
+    While the sub-graph is still bargaining (agent running, this is the tail block, and no
+    winning quote has landed yet) we show a live "Negotiating with SUP-B and SUP-C…" spinner
+    via `st.status(state="running")`. Once the "Best quote secured" line arrives — or the run
+    ends — it renders as a STATIC "Negotiation successful" header with the same green-circle
+    check badge as the cards, and the buyer<->supplier chat transcript inside a COLLAPSED
+    expander. (Static-once-done avoids the st.status re-mount flicker; the transient spinner
+    only appears during the genuinely-in-progress LIVE window.)
     """
-    st.subheader("Supplier negotiation")
-    for _k, message, data in steps:
-        role = str(data.get("role", "system"))
-        if role == "buyer":
-            with st.chat_message("user", avatar="🧑‍💼"):
+    # Discover the vendors being negotiated with (from the opening system event's `vendors`
+    # datum; fall back to the distinct supplier ids seen in the transcript).
+    vendors = ""
+    for _k, _m, data in steps:
+        if data.get("vendors"):
+            vendors = str(data["vendors"])
+            break
+    if not vendors:
+        seen = [str(d["supplier"]) for _k, _m, d in steps if d.get("supplier")]
+        # de-dupe preserving order
+        vendors = ", ".join(dict.fromkeys(seen))
+    vendors_phrase = vendors.replace(", ", " and ") if vendors else "alternate suppliers"
+
+    # Done when the winning-quote system line has arrived (or the run has otherwise ended).
+    done = any(str(m).startswith("Best quote secured") for _k, m, _d in steps) or not (
+        running and is_last
+    )
+
+    def _emit_transcript() -> None:
+        for _k, message, data in steps:
+            role = str(data.get("role", "system"))
+            # Skip the orchestrator's opening "Negotiating concurrently with N alternate
+            # suppliers…" framing line — it's redundant once the header states the outcome.
+            if role == "system" and str(message).startswith("Negotiating concurrently"):
+                continue
+            if role == "buyer":
+                with st.chat_message("user", avatar="🧑‍💼"):
+                    st.markdown(_md(message))
+            elif role == "supplier":
+                sid = str(data.get("supplier", "Supplier"))
+                with st.chat_message("assistant", avatar="🏭"):
+                    st.markdown(_md(f"**{sid}:** {message}"))
+            else:
+                # System framing lines (bidding open / best quote) as a plain notice.
                 st.markdown(_md(message))
-        elif role == "supplier":
-            sid = str(data.get("supplier", "Supplier"))
-            with st.chat_message("assistant", avatar="🏭"):
-                st.markdown(_md(f"**{sid}:** {message}"))
-        else:
-            # System framing lines (bidding open / best quote) as a plain notice.
-            st.markdown(_md(message))
+
+    if not done:
+        # Genuinely in-progress (LIVE bargaining window). Render a PLAIN STATIC line — NOT an
+        # st.status widget, which re-mounts on every 0.4s rerun and flickers. Plain markdown
+        # re-prints identically each rerun, so it's flicker-free; the single tail
+        # "Agent is reasoning…" spinner provides the live motion cue.
+        st.markdown(f"**Negotiating with {vendors_phrase}…**")
+        return
+
+    # Completed: STATIC green-circle header + collapsed transcript (no flicker on reruns).
+    st.markdown(_done_header("Negotiation successful"), unsafe_allow_html=True)
+    with st.expander("View negotiation transcript", expanded=False):
+        _emit_transcript()
+
+
+
+
 
 
 def _render_activity_log(sess: AgentSession) -> None:
@@ -498,9 +566,10 @@ def _render_activity_log(sess: AgentSession) -> None:
     for i, (block_kind, payload) in enumerate(blocks):
         is_last = i == len(blocks) - 1
         if block_kind == "card":
-            _render_react_card(payload, is_last, sess.running)
+            _render_react_card(payload)
         elif block_kind == "negotiation":
-            _render_negotiation(payload)
+            _render_negotiation(payload, is_last, sess.running)
+
         elif block_kind == "guardrail":
             _k, message, data = payload
             if data.get("passed"):
@@ -510,6 +579,15 @@ def _render_activity_log(sess: AgentSession) -> None:
         elif block_kind == "hitl":
             _k, message, _data = payload
             st.markdown(f"**Human Review** — {_md(str(message))}")
+
+    # LIVE "working" indicator: a single spinner at the TAIL of the log while the agent
+    # thread is still alive. This is the honest in-progress cue — the real LLM latency happens
+    # BETWEEN steps (inside _reason, before the next card exists), so a per-card spinner can
+    # never show; one tail spinner tied to `running` captures that dead-air correctly and,
+    # being a single element, cannot flicker. (Offline finishes in ~ms so it's rarely seen.)
+    if sess.running and not (sess.bridge.pending and sess.bridge.result is not None):
+        st.status("🧠 Agent is reasoning…", state="running", expanded=False)
+
 
     # Inline HITL approval gate — rendered at the tail of the log when a spend breach is
     # actively awaiting a human verdict (the agent's event loop is paused on the bridge).
@@ -532,13 +610,14 @@ def _render_activity_log(sess: AgentSession) -> None:
 
 
 
-def _render_resolution(sess: AgentSession, ledger: Any) -> None:
+def _render_resolution(sess: AgentSession, outcome: Optional[str]) -> None:
     """Zone 3 — plain-English resolution summary with a thin green/red status label.
 
-    Prefers the orchestrator's streamed `resolution` event text, but falls back to a
-    snapshot-derived recap so this panel is NEVER blank at the climax of a demo. The summary
-    body is rendered as normal markdown (unified font, `$` escaped); the color cue is a
-    compact status label above it — NOT a full alert box — so the font matches the log.
+    Uses the orchestrator's streamed `resolution` event text for the body, and the LATCHED
+    `outcome` ("resolved"/"escalated") for the color label — NOT a fresh ledger read — so the
+    label is monotonic and can never flip during the post-approve settling window. The body is
+    rendered as normal markdown (unified font, `$` escaped); the color cue is a compact status
+    label above it (not a full alert box) so the font matches the log.
     """
     resolution_msg: Optional[str] = None
     for kind, message, _data in reversed(sess.events):
@@ -546,24 +625,11 @@ def _render_resolution(sess: AgentSession, ledger: Any) -> None:
             resolution_msg = message
             break
 
-    breached = ledger.status.guardrail_status == "BREACHED"
+    escalated = outcome == "escalated"
 
     if resolution_msg is None:
-        # Snapshot-derived fallback (only meaningful once the run is essentially finished).
-        if breached:
-            resolution_msg = (
-                f"Incident escalated — {ledger.status.escalation_reason or 'guardrail breached'}. "
-                f"No purchase order placed; projected loss ${ledger.metrics.projected_total_loss_usd:,.0f} "
-                "remains unmitigated."
-            )
-        elif ledger.status.goal_achieved:
-            resolution_msg = (
-                f"Incident resolved via {ledger.mitigation.active_strategy}. "
-                f"Projected loss ${ledger.metrics.projected_total_loss_usd:,.0f} averted."
-            )
-        else:
-            st.caption("The resolution summary will appear here once the agent concludes.")
-            return
+        st.caption("The resolution summary will appear here once the agent concludes.")
+        return
 
     # Strip any leading status glyph the orchestrator prepended; the color label carries it.
     body = resolution_msg
@@ -572,11 +638,12 @@ def _render_resolution(sess: AgentSession, ledger: Any) -> None:
             body = body[len(glyph):].strip()
 
     st.subheader("Resolution")
-    if breached:
+    if escalated:
         st.markdown(":red[**● ESCALATED**]")
     else:
         st.markdown(":green[**● RESOLVED**]")
     st.markdown(_md(body))
+
 
 
 def main() -> None:
@@ -600,10 +667,11 @@ def main() -> None:
         # operator turns Offline OFF, so it's obvious a key must be present in the .env — and
         # that the run gracefully falls back to the deterministic planner if it's missing.
         if not offline:
-            st.info(
-                "Live mode uses Google Gemini and requires `GEMINI_API_KEY` in your `.env`. "
-                "Without it, the run automatically falls back to the deterministic planner."
+            st.caption(
+                "Live mode needs `GEMINI_API_KEY` in `.env`; without it, it falls back to "
+                "the offline planner."
             )
+
 
         # ORDER QUANTITY — the single lever the agent's strategy EMERGES from (no scenario
         # switch). It is compared against the fixed resources below; a bigger order closes
@@ -704,12 +772,13 @@ def main() -> None:
     if not sess.started:
         st.info(
             "Set the **order quantity** and **shipment delay** in the sidebar, then press "
-            "**Start**. The agent's mitigation choice emerges from the quantity vs the "
-            "incident's resources: try **300** (internal transfer, no spend), **400** "
-            "(air-freight expedite), then **500** to force an alternate-supplier purchase "
-            "that breaches the spend authority and triggers human review."
+            "**Start**. The agent chooses its own mitigation from the order size: try "
+            "**≤ 300** for an autonomous internal-transfer resolution, or **≥ 500** to force "
+            "an alternate-supplier purchase that breaches spend authority and triggers "
+            "**human review**."
         )
         return
+
 
 
     if sess.error:
@@ -729,22 +798,42 @@ def main() -> None:
         f"· Severity {meta.severity}{core_note}"
     )
 
+    # LATCH THE TERMINAL OUTCOME ONCE (flicker fix): the moment the run has genuinely settled
+    # (thread dead), record "resolved"/"escalated" a SINGLE time from the orchestrator's final
+    # `resolution` event (which carries a `resolved` bool) — never re-derived from the live
+    # ledger. Because it's written once and then frozen, the vitals + Zone-3 label can't flip
+    # between Escalated and Resolved during the post-approve settling repaints.
+    finished = not sess.running and not _thread_alive(sess)
+    if finished and sess.outcome is None:
+        resolved = True
+        for kind, message, data in reversed(sess.events):
+            if kind == "resolution" and message != "Incident assessment complete.":
+                resolved = bool(data.get("resolved", not ledger.status.guardrail_status == "BREACHED"))
+                break
+        else:
+            # No resolution event captured — fall back to the settled ledger state.
+            resolved = ledger.status.guardrail_status != "BREACHED"
+        sess.outcome = "resolved" if resolved else "escalated"
+
     # ------------------------------- Zone 1: vitals ------------------------------------ #
-    _render_vitals(ledger, sess.running)
+    _render_vitals(ledger, sess.running, sess.outcome)
     st.divider()
 
     # ------------------------------ Zone 2: activity log ------------------------------- #
     _render_activity_log(sess)
 
     # ------------------------------- Zone 3: resolution -------------------------------- #
-    finished = not sess.running and not _thread_alive(sess)
+    # Only shown once the incident has SETTLED (resolved/escalated) — including the State
+    # Ledger JSON, which is the concrete "single source of truth" architecture proof judges
+    # can inspect. Kept out of the live view (mid-run JSON is noise) and surfaced only at the
+    # end as an audit artifact.
     if finished:
         st.divider()
-        _render_resolution(sess, ledger)
+        _render_resolution(sess, sess.outcome)
 
-    # --------------------------- Architecture proof (collapsed) ------------------------ #
-    with st.expander("State Ledger (JSON) — single source of truth"):
-        st.json(ledger.model_dump(mode="json"))
+        with st.expander("State Ledger (JSON) — single source of truth"):
+            st.json(ledger.model_dump(mode="json"))
+
 
     # ------------------------------- Live refresh loop --------------------------------- #
     # Keep repainting while the agent is working or a HITL decision is pending, plus extra

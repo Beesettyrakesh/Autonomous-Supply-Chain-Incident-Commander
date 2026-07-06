@@ -98,7 +98,21 @@ async def generate_with_retry(
     """
     from google.genai import errors as genai_errors  # type: ignore
 
+    # httpx is a transitive dependency of google-genai (its HTTP transport), so it is always
+    # importable here. We catch its transport-level errors (dropped connection / timeout) as
+    # TRANSIENT and retry — a `ReadError`/`ConnectError` is exactly the kind of network blip
+    # that usually succeeds on a retry, and must NEVER crash the ReAct loop.
+    transport_errors: tuple[type[BaseException], ...]
+    try:
+        import httpx  # type: ignore
+
+        transport_errors = (httpx.TransportError,)
+    except Exception:  # pragma: no cover - httpx should always be present
+        transport_errors = ()
+
+
     def _log(msg: str) -> None:
+
         if log is not None:
             try:
                 log(source, msg)
@@ -133,8 +147,23 @@ async def generate_with_retry(
             _log(f"LLM 5xx attempt={attempt}/{LLM_MAX_RETRIES}; backing off {delay:.1f}s")
             if attempt < LLM_MAX_RETRIES:
                 await asyncio.sleep(delay)
+        except transport_errors as exc:  # dropped connection / read-write / timeout
+            # Transport-level failure (e.g. httpx.ReadError / ConnectError / ReadTimeout):
+            # the HTTP connection to Gemini dropped mid-request. This is transient and
+            # typically succeeds on retry — treat it like a 5xx (backoff + retry) instead of
+            # letting it escape and crash the ReAct loop. After the last attempt it falls
+            # through to the LLMUnavailableError below -> clean HUMAN TAKEOVER by the caller.
+            last_exc = exc
+            delay = min(2.0 ** attempt, LLM_RETRY_CAP_SECONDS)
+            _log(
+                f"LLM transport error ({type(exc).__name__}) attempt={attempt}/{LLM_MAX_RETRIES}; "
+                f"backing off {delay:.1f}s"
+            )
+            if attempt < LLM_MAX_RETRIES:
+                await asyncio.sleep(delay)
 
     raise LLMUnavailableError(
+
         f"LLM unavailable after {LLM_MAX_RETRIES} attempts: {last_exc}"
     )
 
