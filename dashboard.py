@@ -74,15 +74,21 @@ _TOOL_PURPOSE: Dict[str, str] = {
 
 
 # Hide Streamlit's developer chrome (toolbar/Deploy button, main menu, footer, header) so the
-# demo reads as an enterprise console rather than a dev sandbox.
+# demo reads as an enterprise console rather than a dev sandbox. The sidebar collapse control
+# is also hidden: hiding the header removes Streamlit's re-expand button, so allowing a
+# collapse would strand the user with no way back — instead the sidebar stays fixed open.
+# Both testids are covered because the control was renamed across Streamlit versions.
 _HIDE_CHROME_CSS = """
 <style>
 [data-testid="stToolbar"] { visibility: hidden; height: 0; position: fixed; }
 #MainMenu { visibility: hidden; }
 footer { visibility: hidden; }
 header { visibility: hidden; }
+[data-testid="stSidebarCollapseButton"] { display: none; }
+[data-testid="stSidebarCollapsedControl"] { display: none; }
 </style>
 """
+
 
 
 def _md(text: str) -> str:
@@ -565,7 +571,12 @@ def _render_resolution(sess: AgentSession, outcome: Optional[str]) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Incident Command Center", layout="wide")
+    st.set_page_config(
+        page_title="Incident Command Center",
+        layout="wide",
+        initial_sidebar_state="expanded",  # sidebar stays fixed open (collapse control hidden)
+    )
+
     st.markdown(_HIDE_CHROME_CSS, unsafe_allow_html=True)
 
     sess = _get_session()
