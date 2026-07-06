@@ -243,11 +243,18 @@ def _configure_reasoning_core(live: bool) -> None:
     """
     if live:
         os.environ["VENDOR_MODE"] = "llm"
+        # Live path uses REAL MCP: spawn the 3 category servers and call their tools over the
+        # MCP protocol (stdio). Override with MCP_TRANSPORT=inproc if you want direct calls.
+        os.environ.setdefault("MCP_TRANSPORT", "stdio")
         # GEMINI_API_KEY is not touched here — it must come from the environment / .env. If
         # absent, the orchestrator falls back to the offline planner automatically.
     else:
         os.environ["GEMINI_API_KEY"] = ""            # -> deterministic offline planner
         os.environ["VENDOR_MODE"] = "deterministic"  # -> scripted vendor (no LLM calls)
+        # Offline path defaults to in-process tools for a fast, deterministic run; set
+        # MCP_TRANSPORT=stdio to exercise the real MCP servers offline too.
+        os.environ.setdefault("MCP_TRANSPORT", "inproc")
+
 
 
 async def _run(args: argparse.Namespace) -> int:

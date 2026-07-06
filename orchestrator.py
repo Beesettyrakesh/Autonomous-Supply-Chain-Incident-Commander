@@ -36,11 +36,15 @@ from pydantic import ValidationError
 
 from ledger_store import STORE, LedgerStore
 # MCP Observation Tools are split across three category servers (ERP / Inventory-WMS /
-# Logistics-TMS); the commander wires its tool registry from each server directly.
+# Logistics-TMS). The commander reaches them as an MCP CLIENT through `mcp_client`: in the
+# live path each server runs as its own subprocess and tools are invoked over the MCP protocol
+# (stdio); the offline/test path calls the same tool functions in-process for determinism.
 import mcp_servers.erp_server as erp
 import mcp_servers.inventory_server as inventory
 import mcp_servers.logistics_server as logistics
 import decision_helpers
+from mcp_client import MCPToolGateway, build_inproc_invoker, ToolInvoker
+
 
 
 from negotiation_agent import run_supplier_negotiation, TermsDict
@@ -56,6 +60,18 @@ from llm_utils import generate_with_retry, LLMUnavailableError
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 # Circuit-breaker bound mirrored from the schema (loop_count le=11, escalate past 10).
 MAX_LOOPS = 10
+
+# MCP transport for the Observation Tools (read live from the environment at run start, so a
+# UI/CLI that sets it just before launching the loop is honoured):
+#   "stdio"  -> REAL MCP: each category server runs as a subprocess and tools are invoked over
+#               the MCP protocol (used for the live demo).
+#   "inproc" -> the same tool functions are called directly in-process (deterministic; the
+#               default for the offline test suite and CI).
+def _resolve_mcp_transport() -> str:
+    """Return the active MCP transport ('stdio' or 'inproc') from the environment."""
+    return "stdio" if os.environ.get("MCP_TRANSPORT", "inproc").strip().lower() == "stdio" else "inproc"
+
+
 
 
 # Order quantity for the mitigation purchase — the per-incident variable that drives total
@@ -133,9 +149,18 @@ TOOL_REGISTRY: Dict[str, ToolFn] = {
 
 
 
+# Observation tools served over MCP (the client routes these to the category servers). The
+# Decision Helpers (simulate_finance / score_strategy / policy_check) are deterministic local
+# math and are intentionally NOT MCP tools — they run in-process.
+OBSERVATION_TOOLS = frozenset(
+    {"query_erp", "query_inventory", "query_shipment_tracking", "extract_contract_rules"}
+)
+
+
 # Allowed mitigation strategies — must match the Literal set in schema.MitigationState.
 # Published to the LLM so it never invents an out-of-schema value (e.g. "EXPEDITE").
 VALID_STRATEGIES = ("ALT_SUPPLIER", "INTERNAL_TRANSFER", "AIR_FREIGHT")
+
 
 # Virtual (non-registry) actions the orchestrator handles itself. `commit_strategy` is a
 # selection decision; `DONE` is the terminal signal.
@@ -262,6 +287,20 @@ class IncidentCommander:
         self.human_decision: HumanDecisionFn = human_decision or _default_human_decision
         # Observational narration sink (optional); behaviour-neutral.
         self.on_event: Optional[EventFn] = on_event
+        # MCP client gateway (stdio transport) — created on demand in `run()` when
+        # MCP_TRANSPORT=="stdio"; None on the in-process path.
+        self._mcp_gateway: Optional[MCPToolGateway] = None
+        # Async invoker for the observation tools. Defaults to the in-process invoker so a
+        # commander used directly (e.g. a unit test calling `_dispatch_tool`) always works; the
+        # stdio gateway invoker is installed for the duration of `run()` when selected.
+        self._tool_invoker: ToolInvoker = build_inproc_invoker()
+
+    @property
+    def mcp_transport(self) -> str:
+        """Active MCP transport for the observation tools ('stdio' or 'inproc')."""
+        return _resolve_mcp_transport()
+
+
 
     def _emit(self, kind: str, message: str, **data: Any) -> None:
         """Fire the observational event sink (if any). Never affects control flow.
@@ -614,12 +653,16 @@ class IncidentCommander:
     # ------------------------------------------------------------------ #
     # Acting: dispatch the selected tool and translate output into a ledger patch.
     # ------------------------------------------------------------------ #
-    def _dispatch_tool(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _dispatch_tool(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a registered tool, injecting the ledger snapshot where required.
 
+        Observation tools are invoked through the active MCP transport (`self._tool_invoker`):
+        over the MCP protocol to a category-server subprocess under the stdio transport, or
+        directly in-process under the deterministic transport. Decision Helpers run locally.
         Validates arguments defensively BEFORE running the tool so a schema-noncompliant LLM
         output becomes a recoverable error Observation instead of a downstream crash.
         """
+
         # Security: sanitize every dispatched tool's args (defense-in-depth). A hit aborts with
         # a recoverable error Observation and the loop continues safely.
         try:
@@ -666,8 +709,18 @@ class IncidentCommander:
                 }
             return {"result": {"committed_strategy": strat}}
 
+        # Observation tools go through the active MCP transport (stdio subprocess or in-process
+        # invoker). This is the real MCP client boundary.
+        if tool in OBSERVATION_TOOLS:
+            try:
+                result = await self._tool_invoker(tool, args)
+            except Exception as exc:  # transport/tool failure -> recoverable error Observation
+                LedgerStore.append_raw_log("orchestrator", f"MCP_TOOL_ERROR tool={tool} args={args} err={exc!r}")
+                return {"result": {"error": f"MCP tool '{tool}' failed: {exc}"}}
+            return {"result": result}
+
+        # Decision Helpers run locally (deterministic math, not MCP tools).
         fn = TOOL_REGISTRY[tool]
-        # Decision Helpers that reason over full state receive the live snapshot.
         if tool in ("simulate_finance", "score_strategy"):
             args = {**args, "state_ledger_snapshot": self.store.snapshot_dict()}
         # Resilience: guard the call so a bad signature (e.g. a missing arg) becomes a
@@ -678,6 +731,7 @@ class IncidentCommander:
             LedgerStore.append_raw_log("orchestrator", f"BAD_TOOL_ARGS tool={tool} args={args} err={exc}")
             return {"result": {"error": f"invalid arguments for '{tool}': {exc}"}}
         return {"result": result}
+
 
     def _mutation_for(self, tool: str, output: Dict[str, Any]) -> Dict[str, Any]:
         """Map a tool's parsed output to a validated State Ledger patch (Mutation Layer)."""
@@ -1021,8 +1075,48 @@ class IncidentCommander:
         Async so it can `await` the negotiation sub-graph.
         """
         trace: List[Dict[str, Any]] = []
+        await self._start_transport(verbose)
+        try:
+            return await self._run_loop(trace, max_loops, verbose)
+        finally:
+            await self._stop_transport()
 
+    async def _start_transport(self, verbose: bool) -> None:
+        """Bring up the MCP client gateway when the stdio transport is selected.
+
+        Spawns the three category servers as subprocesses and installs the gateway's async
+        invoker. If startup fails, we fall back to the in-process invoker so the run still
+        completes — the observation tools produce identical results either way.
+        """
+        if self.mcp_transport != "stdio":
+            return
+        gateway = MCPToolGateway()
+        try:
+            await gateway.start()
+        except Exception as exc:  # pragma: no cover - defensive: degrade to in-process
+            LedgerStore.append_raw_log("orchestrator", f"MCP_STDIO_START_FAILED err={exc!r}; using in-process tools")
+            if verbose:
+                print(f"[MCP] stdio transport unavailable ({exc}); falling back to in-process tools.")
+            await gateway.aclose()
+            return
+        self._mcp_gateway = gateway
+        self._tool_invoker = gateway.call_tool
+        if verbose:
+            print("[MCP] Connected to 3 category servers over stdio (oscar-erp / -inventory-wms / -logistics-tms).")
+
+    async def _stop_transport(self) -> None:
+        """Tear down the MCP client gateway (and its server subprocesses), if started."""
+        if self._mcp_gateway is not None:
+            await self._mcp_gateway.aclose()
+            self._mcp_gateway = None
+            self._tool_invoker = build_inproc_invoker()
+
+    async def _run_loop(
+        self, trace: List[Dict[str, Any]], max_loops: int, verbose: bool
+    ) -> List[Dict[str, Any]]:
+        """The closed ReAct loop body (transport is already established by `run`)."""
         while True:
+
             ledger = self.store.snapshot()
 
             # Circuit breaker: never exceed the hard loop bound.
@@ -1089,8 +1183,9 @@ class IncidentCommander:
                 self.store.increment_loop()
                 continue
 
-            output = self._dispatch_tool(tool, args)
+            output = await self._dispatch_tool(tool, args)
             observation: Any = output["result"]
+
             # Narrate the tool's result as a data-rich plain-English line for the UI.
             self._emit("observation", self._humanize_observation(tool, observation), tool=tool)
             patch = self._mutation_for(tool, output)

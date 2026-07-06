@@ -89,6 +89,9 @@ def test_feasibility_backstop_blocks_infeasible_commit() -> None:
         delay_days=9,
     )
     commander = IncidentCommander(order_quantity=500)
-    out = commander._dispatch_tool("commit_strategy", {"strategy_type": "INTERNAL_TRANSFER"})
+    # _dispatch_tool is async (observation tools flow through the MCP client transport); the
+    # feasibility backstop still resolves synchronously for commit_strategy.
+    out = asyncio.run(commander._dispatch_tool("commit_strategy", {"strategy_type": "INTERNAL_TRANSFER"}))
     assert "error" in out["result"]
     assert "INFEASIBLE" in out["result"]["error"]
+

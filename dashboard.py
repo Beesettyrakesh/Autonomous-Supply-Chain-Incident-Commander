@@ -218,14 +218,20 @@ def _run_agent(sess: AgentSession, params: Dict[str, Any]) -> None:
     """
     saved_key = os.environ.get("GEMINI_API_KEY", "")
     saved_vendor = os.environ.get("VENDOR_MODE", "")
+    saved_transport = os.environ.get("MCP_TRANSPORT", "")
     try:
         # Reasoning core selection (offline default protects the free quota).
         if params["offline"]:
             os.environ["GEMINI_API_KEY"] = ""            # -> deterministic offline planner
             os.environ["VENDOR_MODE"] = "deterministic"  # -> scripted vendor (no LLM calls)
+            os.environ["MCP_TRANSPORT"] = "inproc"        # -> fast, deterministic in-process tools
         else:
             os.environ["GEMINI_API_KEY"] = params["gemini_key"]  # -> live Gemini core
             os.environ["VENDOR_MODE"] = "llm"
+            # Live path uses REAL MCP: the 3 category servers run as subprocesses and their
+            # tools are invoked over the MCP protocol (stdio).
+            os.environ["MCP_TRANSPORT"] = "stdio"
+
 
         commander = IncidentCommander(
             order_quantity=params["order_quantity"],
@@ -245,7 +251,9 @@ def _run_agent(sess: AgentSession, params: Dict[str, Any]) -> None:
         # Restore the process env so mode selection never leaks between runs.
         os.environ["GEMINI_API_KEY"] = saved_key
         os.environ["VENDOR_MODE"] = saved_vendor
+        os.environ["MCP_TRANSPORT"] = saved_transport
         sess.running = False
+
 
 
 # --------------------------------------------------------------------------- #
