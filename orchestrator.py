@@ -205,14 +205,18 @@ option is or isn't executable this incident, not just a true/false flag:
   the required replacement quantity (metrics.transferable_units >= metrics.replacement_order_qty).
   If the available surplus is smaller than the shortfall, an internal transfer CANNOT close the
   gap this incident — so explain it that way and move to the next viable option.
-- AIR_FREIGHT: only works if the carrier has air capacity to expedite this specific delayed PO
-  (metrics.air_freight_available is true). If no air capacity is available on this lane, the
-  option cannot be executed regardless of how attractive its speed score is — say so plainly.
-  (Do NOT justify skipping it on cost; the reason is lack of available air capacity.)
+- AIR_FREIGHT: only works if the lane is open (metrics.air_freight_available is true) AND the
+  carrier's finite air cargo capacity can cover the required quantity
+  (metrics.air_freight_capacity_units >= metrics.replacement_order_qty). Aircraft hold volume is
+  limited, so a large order can EXCEED the available air capacity — in that case air freight
+  cannot be executed regardless of how attractive its speed score is; say so plainly, citing the
+  capacity vs the required quantity. (Do NOT justify skipping it on unit cost.)
 - ALT_SUPPLIER: the approved alternate-vendor pool is always a viable sourcing path, so when
   the internal and expedite routes are closed, source from an alternate supplier and negotiate.
 This mirrors real procurement escalation: use internal stock if it suffices, else expedite by
-air if capacity exists, else source from an approved alternate supplier.
+air if there is enough air capacity, else source from an approved alternate supplier. Which one
+is feasible EMERGES from the required quantity — you are not told which to pick.
+
 {TOOL_CATALOG}
 
 ONE-SHOT FORMAT EXAMPLE (this exact two-line structure is REQUIRED every turn):
@@ -470,12 +474,17 @@ class IncidentCommander:
                     "args": {"contract_id": ctx["active_contract_id"]},
                 },
             }
-        # 2) Quantify financial exposure now that the rate is known.
+        # 2) Quantify financial exposure now that the rate is known. Pass NO explicit
+        # delay_days so simulate_finance reads the OBSERVED slip from the ledger
+        # (metrics.delay_days, seeded at init / written by query_shipment_tracking) — this is
+        # what makes the projected loss DYNAMIC: change the incident's delay and the exposure
+        # recomputes, instead of being pinned to a hardcoded literal.
         if metrics.get("projected_total_loss_usd", 0.0) == 0.0:
             return {
-                "thought": "Penalty rate known; simulate the financial impact of the delay.",
-                "action": {"tool": "simulate_finance", "args": {"delay_days": 9}},
+                "thought": "Penalty rate known; simulate the financial impact of the observed delay.",
+                "action": {"tool": "simulate_finance", "args": {}},
             }
+
         # 3) Evaluate (score) the candidate strategies — recording only, not selecting.
         for candidate in VALID_STRATEGIES:
             if candidate not in scores:
@@ -519,6 +528,7 @@ class IncidentCommander:
         transferable = int(metrics.get("transferable_units", 0))
         required = int(metrics.get("replacement_order_qty") or self.order_quantity)
         air_available = bool(metrics.get("air_freight_available", True))
+        air_capacity = int(metrics.get("air_freight_capacity_units", 0))
 
         reasons: List[str] = []
         if "INTERNAL_TRANSFER" not in feasible:
@@ -526,10 +536,18 @@ class IncidentCommander:
                 f"the sister site's transferable surplus ({transferable} units) can't cover the "
                 f"{required}-unit shortfall, so an internal transfer won't close the gap"
             )
-        if "AIR_FREIGHT" not in feasible and not air_available:
-            reasons.append(
-                "the carrier has no air capacity to expedite this PO, so air freight can't be executed"
-            )
+        if "AIR_FREIGHT" not in feasible:
+            # Distinguish WHY air is closed: the lane is grounded vs the finite air cargo
+            # capacity simply can't fit this order (the quantity-driven escalation trigger).
+            if not air_available:
+                reasons.append(
+                    "the carrier has no air capacity on this lane, so air freight can't be executed"
+                )
+            else:
+                reasons.append(
+                    f"the available air cargo capacity ({air_capacity} units) can't fit the "
+                    f"{required}-unit order, so air freight can't be executed at this volume"
+                )
 
         if best == "ALT_SUPPLIER":
             lead = "With the internal and expedite routes closed, " if reasons else ""
@@ -545,11 +563,18 @@ class IncidentCommander:
                 "spend — committing INTERNAL_TRANSFER."
             )
         if best == "AIR_FREIGHT":
+            surplus_note = (
+                f"the internal surplus ({transferable} units) can't cover the {required}-unit order, but "
+                if "INTERNAL_TRANSFER" not in feasible
+                else ""
+            )
             return (
-                "Air capacity is available to expedite the delayed PO, which best protects production "
-                "against the downtime exposure — committing AIR_FREIGHT."
+                f"{surplus_note}the air cargo capacity ({air_capacity} units) can expedite the full "
+                f"{required}-unit order, which best protects production against the downtime exposure "
+                "— committing AIR_FREIGHT."
             )
         return f"Committing {best} as the best feasible mitigation for this incident."
+
 
 
     def _is_strategy_feasible(self, strategy: str, metrics: Dict[str, Any]) -> bool:
@@ -574,8 +599,14 @@ class IncidentCommander:
             required = int(metrics.get("replacement_order_qty") or self.order_quantity)
             return int(metrics.get("transferable_units", 0)) >= required
         if strategy == "AIR_FREIGHT":
-            return bool(metrics.get("air_freight_available", True))
+            # Air is feasible only if the lane is open AND the FINITE air cargo capacity can
+            # cover the required quantity — aircraft hold volume is limited, so a large order
+            # can exceed it and force escalation to an alternate supplier.
+            required = int(metrics.get("replacement_order_qty") or self.order_quantity)
+            capacity = int(metrics.get("air_freight_capacity_units", 0))
+            return bool(metrics.get("air_freight_available", True)) and capacity >= required
         return True
+
 
 
 
@@ -1267,30 +1298,33 @@ class IncidentCommander:
         return trace
 
 
-# Demo scenarios (feasibility presets). Selected via the SCENARIO env var; the dashboard/CLI
-# expose these as a dropdown/flag. Both use the SAME honest scores — only which mitigations
-# are POSSIBLE changes, so the agent's autonomous choice differs organically:
-#   * transfer_available    -> PLANT-1 has ample surplus; INTERNAL_TRANSFER wins (cheapest).
-#                              Demonstrates smart autonomous resolution (no spend, no HITL).
-#   * internal_options_exhausted -> PLANT-1 surplus can't cover the order AND the delayed PO
-#                              can't be air-expedited; the agent escalates to ALT_SUPPLIER →
-#                              negotiation → spend-authority guardrail → HITL.
-SCENARIOS: Dict[str, Dict[str, Any]] = {
-    "transfer_available": {"transferable_units": 900, "air_freight_available": True},
-    "internal_options_exhausted": {"transferable_units": 100, "air_freight_available": False},
-}
+# FIXED incident resources (no scenario presets). The demo has a SINGLE realistic lever —
+# the order quantity — and the agent's autonomous strategy EMERGES from comparing that
+# quantity against these finite resources (no dropdown steers the outcome):
+#   * INTERNAL_TRANSFER surplus : the units PLANT-1 can spare to PLANT-2.
+#   * AIR_FREIGHT capacity      : the finite air cargo volume available on this lane.
+#   * ALT_SUPPLIER              : always feasible (approved alternate-vendor pool).
+# As the quantity grows past each resource the option closes, so the agent escalates
+# INTERNAL_TRANSFER -> AIR_FREIGHT -> ALT_SUPPLIER purely on volume. A SECOND independent
+# lever — the shipment delay (days) — drives the DYNAMIC financial exposure via
+# simulate_finance (bigger delay => bigger projected loss), fully decoupled from the strategy.
+INTERNAL_TRANSFER_SURPLUS_UNITS = int(os.environ.get("INTERNAL_TRANSFER_SURPLUS_UNITS", "350"))
+AIR_FREIGHT_CAPACITY_UNITS = int(os.environ.get("AIR_FREIGHT_CAPACITY_UNITS", "420"))
+# Baseline enterprise revenue exposure for the incident (drives penalty + downtime math).
+REVENUE_AT_RISK_USD = float(os.environ.get("REVENUE_AT_RISK_USD", "75000"))
+# Observed shipment slip in days — the second live lever (default 9). Bigger => bigger loss.
+DELAY_DAYS = int(os.environ.get("DELAY_DAYS", "9"))
 
 
 async def main() -> None:
     """Demo entry point: initialize the target incident and run the async loop.
 
-    The SCENARIO env var picks the feasibility preset (default `transfer_available`, which
-    resolves via INTERNAL_TRANSFER). Set `SCENARIO=internal_options_exhausted` to demo the
-    ALT_SUPPLIER negotiation + spend-authority guardrail + HITL path.
+    The incident is driven by TWO independent, realistic levers (no scenario switch):
+      * ORDER_QUANTITY  -> which mitigation is feasible (INTERNAL_TRANSFER / AIR_FREIGHT /
+                           ALT_SUPPLIER), and therefore the agent's autonomous choice + spend.
+      * DELAY_DAYS      -> the shipment slip, which drives the DYNAMIC projected loss.
+    Both are read from the environment so a demo can sweep them without code edits.
     """
-    scenario_name = os.environ.get("SCENARIO", "transfer_available")
-    scenario = SCENARIOS.get(scenario_name, SCENARIOS["transfer_available"])
-
     STORE.init_incident(
         target_sku="SKU-99",
         primary_supplier_id="SUP-A",
@@ -1299,22 +1333,28 @@ async def main() -> None:
         impacted_plants=["PLANT-2"],
         inventory_days_remaining=2,
         production_shutdown_hours=48,
-        revenue_at_risk_usd=4200.0,
-        transferable_units=scenario["transferable_units"],
-        air_freight_available=scenario["air_freight_available"],
+        revenue_at_risk_usd=REVENUE_AT_RISK_USD,
+        transferable_units=INTERNAL_TRANSFER_SURPLUS_UNITS,
+        air_freight_available=True,
+        air_freight_capacity_units=AIR_FREIGHT_CAPACITY_UNITS,
         # Seed the ledger-visible replacement quantity from the SAME value the commander
         # uses for spend, so the LLM's feasibility check and the guardrail's spend math read
         # one consistent number (no hidden-state drift).
         replacement_order_qty=ORDER_QUANTITY,
+        delay_days=DELAY_DAYS,
     )
     commander = IncidentCommander()
 
     mode = "LLM (Gemini)" if commander.llm_enabled else "OFFLINE deterministic planner"
     print(f"Incident Commander reasoning core: {mode} | model={GEMINI_MODEL}")
-    print(f"Scenario: {scenario_name} ({scenario})")
+    print(
+        f"Levers: order_qty={ORDER_QUANTITY}, delay_days={DELAY_DAYS} | "
+        f"resources: surplus={INTERNAL_TRANSFER_SURPLUS_UNITS}, air_capacity={AIR_FREIGHT_CAPACITY_UNITS}"
+    )
     await commander.run()
     print("\nFinal ledger:")
     print(STORE.snapshot().model_dump_json(indent=2))
+
 
 
 

@@ -22,19 +22,38 @@ Design (mirrors the dashboard, minus Streamlit):
   `--hitl approve` / `--hitl reject` are non-interactive for scripts/CI. The provider is a
   plain sync callable — the orchestrator awaits it transparently (`inspect.isawaitable`).
 
+The agent's mitigation choice is NOT steered by a scenario switch — it EMERGES from a single
+realistic lever, the order quantity, compared against the incident's finite resources
+(internal transfer surplus 350 units, air cargo capacity 420 units, and an always-available
+alternate-supplier pool). A second independent lever, the shipment delay in days, drives the
+DYNAMIC financial exposure (bigger delay => bigger projected loss).
+
+Quantity ladder (default delay 9 days, revenue-at-risk $75,000 => projected loss $357,750):
+    qty 300  -> INTERNAL_TRANSFER  (<= 350 surplus; autonomous, $0 spend)
+    qty 400  -> AIR_FREIGHT        (> 350 surplus, <= 420 air capacity; autonomous)
+    qty 440  -> ALT_SUPPLIER       (> 420; negotiate -> $19,360 <= $20k -> auto-approved)
+    qty 500  -> ALT_SUPPLIER       (> 420; negotiate -> $22,000 > $20k -> HUMAN review)
+
 Examples:
     # Autonomous internal-transfer resolution (no spend, no human):
-    .venv/bin/python agent_cli.py --scenario transfer_available
+    .venv/bin/python agent_cli.py --qty 300
+
+    # Autonomous air-freight expedite (order exceeds internal surplus, fits air capacity):
+    .venv/bin/python agent_cli.py --qty 400
+
+    # Alternate-supplier purchase within authority (no human review needed):
+    .venv/bin/python agent_cli.py --qty 440
 
     # Escalate → negotiate → spend guardrail → reject at the human gate:
-    .venv/bin/python agent_cli.py --scenario internal_options_exhausted --qty 500 --hitl reject
+    .venv/bin/python agent_cli.py --qty 500 --hitl reject
 
     # Same path, but a human approves the over-limit spend:
-    .venv/bin/python agent_cli.py --scenario internal_options_exhausted --qty 500 --hitl approve
+    .venv/bin/python agent_cli.py --qty 500 --hitl approve
 
-    # Within-authority alternate-supplier purchase (no human review needed):
-    .venv/bin/python agent_cli.py --scenario internal_options_exhausted --qty 300
+    # Bigger shipment delay drives a larger projected loss (dynamic exposure):
+    .venv/bin/python agent_cli.py --qty 300 --delay 12
 """
+
 
 from __future__ import annotations
 
@@ -197,20 +216,38 @@ def _parse_args(argv: Any = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--scenario",
-        choices=["transfer_available", "internal_options_exhausted"],
-        default="transfer_available",
-        help="Feasibility preset. transfer_available -> autonomous INTERNAL_TRANSFER (no "
-        "spend). internal_options_exhausted -> escalate to ALT_SUPPLIER, negotiate, hit the "
-        "spend guardrail. (default: transfer_available)",
-    )
-    parser.add_argument(
         "--qty",
         type=int,
         default=500,
-        help="Order quantity — drives total spend (unit price x qty) vs the $20k authority. "
-        "~300 stays within authority; ~500 exceeds it and triggers human review. (default: 500)",
+        help="Order quantity — the SINGLE lever the agent's strategy emerges from. It is "
+        "compared against the internal transfer surplus (350) and air cargo capacity (420): "
+        "<=350 -> INTERNAL_TRANSFER; 351-420 -> AIR_FREIGHT; >420 -> ALT_SUPPLIER (negotiate). "
+        "It also sets total spend (unit price x qty) vs the $20k authority. (default: 500)",
     )
+    parser.add_argument(
+        "--delay",
+        type=int,
+        default=9,
+        help="Observed shipment delay in days — the second, independent lever. It drives the "
+        "DYNAMIC projected loss (bigger delay => bigger exposure), not the strategy choice. "
+        "(default: 9)",
+    )
+    parser.add_argument(
+        "--surplus",
+        type=int,
+        default=350,
+        help="Internal transfer surplus (units PLANT-1 can spare). INTERNAL_TRANSFER is "
+        "feasible only when the order quantity is within this. (default: 350)",
+    )
+    parser.add_argument(
+        "--air-capacity",
+        dest="air_capacity",
+        type=int,
+        default=420,
+        help="Finite air cargo capacity (units). AIR_FREIGHT is feasible only when the order "
+        "quantity is within this. (default: 420)",
+    )
+
     parser.add_argument(
         "--hitl",
         choices=["prompt", "approve", "reject"],
@@ -265,7 +302,7 @@ def _configure_reasoning_core(live: bool) -> None:
 async def _run(args: argparse.Namespace) -> int:
     # Import AFTER env is configured so the modules read the intended VENDOR_MODE etc.
     from ledger_store import STORE
-    from orchestrator import IncidentCommander, SCENARIOS, GEMINI_MODEL
+    from orchestrator import IncidentCommander, GEMINI_MODEL, REVENUE_AT_RISK_USD
     from guardrails import SPEND_AUTHORITY_LIMIT_USD
 
     color = not args.no_color
@@ -275,10 +312,11 @@ async def _run(args: argparse.Namespace) -> int:
     renderer = CliRenderer(color=color)
     C, S = renderer.C, renderer.S
 
-    scenario = SCENARIOS.get(args.scenario, SCENARIOS["transfer_available"])
     spend_limit = args.spend_limit if args.spend_limit is not None else float(SPEND_AUTHORITY_LIMIT_USD)
 
-    # Establish the single source of truth (same seed as the dashboard/orchestrator).
+    # Establish the single source of truth. The agent's strategy EMERGES from comparing the
+    # order quantity against the finite resources below (no scenario switch): the shipment
+    # delay independently drives the dynamic projected loss.
     STORE.init_incident(
         target_sku="SKU-99",
         primary_supplier_id="SUP-A",
@@ -287,10 +325,12 @@ async def _run(args: argparse.Namespace) -> int:
         impacted_plants=["PLANT-2"],
         inventory_days_remaining=2,
         production_shutdown_hours=48,
-        revenue_at_risk_usd=4200.0,
-        transferable_units=scenario["transferable_units"],
-        air_freight_available=scenario["air_freight_available"],
+        revenue_at_risk_usd=REVENUE_AT_RISK_USD,
+        transferable_units=args.surplus,
+        air_freight_available=True,
+        air_freight_capacity_units=args.air_capacity,
         replacement_order_qty=args.qty,
+        delay_days=args.delay,
     )
 
     commander = IncidentCommander(
@@ -306,12 +346,13 @@ async def _run(args: argparse.Namespace) -> int:
     print(f"{C.CYAN}{S.BRIGHT}{'=' * 68}{S.RESET_ALL}")
     print(f"{C.CYAN}{S.BRIGHT}  AUTONOMOUS SUPPLY CHAIN INCIDENT COMMANDER — CLI{S.RESET_ALL}")
     print(f"{C.CYAN}{'=' * 68}{S.RESET_ALL}")
-    print(f"  Incident : SKU-99 shipment delayed (SUP-A -> PLANT-2)")
-    print(f"  Scenario : {args.scenario}")
-    print(f"  Order qty: {args.qty}  |  Spend authority: ${spend_limit:,.0f}")
-    print(f"  HITL mode: {args.hitl}")
-    print(f"  Core     : {core}")
+    print(f"  Incident  : SKU-99 shipment delayed {args.delay} days (SUP-A -> PLANT-2)")
+    print(f"  Order qty : {args.qty}  |  Spend authority: ${spend_limit:,.0f}")
+    print(f"  Resources : internal surplus {args.surplus} · air capacity {args.air_capacity} · alt-supplier pool")
+    print(f"  HITL mode : {args.hitl}")
+    print(f"  Core      : {core}")
     print(f"{C.CYAN}{'=' * 68}{S.RESET_ALL}")
+
 
     if args.live and not commander.llm_enabled:
         print(

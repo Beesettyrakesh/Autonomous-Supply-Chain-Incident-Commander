@@ -56,15 +56,21 @@ class ImpactMetrics(BaseModel):
     revenue_at_risk_usd: float
     # --- Mitigation FEASIBILITY signals (single source of truth for which options are even
     # possible this incident). These gate strategy SELECTION deterministically — separate from
-    # the desirability SCORES in score_strategy. Populated at init from the incident scenario.
+    # the desirability SCORES in score_strategy. The agent's autonomous choice EMERGES from
+    # comparing the required `replacement_order_qty` against these finite resources — there is
+    # NO scenario switch steering the outcome; a bigger shortfall organically closes options:
     #   * transferable_units: surplus PLANT-1 can move to PLANT-2. INTERNAL_TRANSFER is only
-    #     feasible when this covers the required order quantity.
-    #   * air_freight_available: whether the delayed PO can be expedited by air on this lane.
-    # Default scenario = both viable (INTERNAL_TRANSFER wins). "internal_options_exhausted"
-    # zeroes them so the agent must organically escalate to ALT_SUPPLIER (negotiation + the
-    # spend-authority guardrail + HITL).
-    transferable_units: int = 900
+    #     feasible when this surplus covers the required order quantity.
+    #   * air_freight_available: whether the delayed PO can be expedited by air on this lane
+    #     at all (a hard on/off for the lane).
+    #   * air_freight_capacity_units: the FINITE air cargo capacity available to expedite this
+    #     PO. AIR_FREIGHT is only feasible when this capacity covers the required quantity —
+    #     realistic, since aircraft have limited hold volume. So as the order quantity grows,
+    #     the agent escalates INTERNAL_TRANSFER -> AIR_FREIGHT -> ALT_SUPPLIER purely on volume.
+    transferable_units: int = 350
     air_freight_available: bool = True
+    air_freight_capacity_units: int = 420
+
     # The replacement order quantity this incident must cover — the SAME value the spend
     # guardrail multiplies by unit price. Held on the ledger (not just in the orchestrator)
     # so the LLM can read it and apply the INTERNAL_TRANSFER feasibility rule

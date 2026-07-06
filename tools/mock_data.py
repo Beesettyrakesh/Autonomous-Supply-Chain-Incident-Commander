@@ -45,7 +45,7 @@ ERP_DB: Dict[str, Dict[str, Any]] = {
                 "rating": "APPROVED",
                 "region": "EU",
                 "unit_cost_usd": 46.75,       # pricier; implies a higher walk-away floor.
-                "quoted_lead_time_days": 6,   # much faster than SUP-A's 14-day base.
+                "quoted_lead_time_days": 8,   # faster than SUP-A's 14-day base, but slower than SUP-C.
                 "min_order_qty": 250,
             },
             {
@@ -53,10 +53,11 @@ ERP_DB: Dict[str, Dict[str, Any]] = {
                 "name": "Supplier C",
                 "rating": "APPROVED",
                 "region": "NA",
-                "unit_cost_usd": 44.00,       # cheaper; implies a lower floor -> likely winner.
-                "quoted_lead_time_days": 8,   # slightly slower than SUP-B.
+                "unit_cost_usd": 44.00,       # cheaper AND faster -> the loss-minimizing winner.
+                "quoted_lead_time_days": 6,   # fastest alternate; cheapest unit price is ALSO the quickest.
                 "min_order_qty": 300,
             },
+
         ],
     }
 }
@@ -77,11 +78,12 @@ INVENTORY_DB: Dict[str, Dict[str, Any]] = {
             {
                 "from_plant": "PLANT-1",
                 "to_plant": "PLANT-2",
-                "transferable_units": 900,   # 1800 on-hand minus 600 safety + buffer.
+                "transferable_units": 350,   # surplus PLANT-1 can spare above its own safety stock.
                 "transit_days": 1,           # domestic sister-site lane; very fast.
                 "transfer_cost_usd": 850.0,  # internal logistics cost.
             }
         ],
+
     }
 }
 

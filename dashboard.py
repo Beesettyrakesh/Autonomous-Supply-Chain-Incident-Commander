@@ -50,8 +50,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 
 from ledger_store import STORE, LedgerStore
-from orchestrator import IncidentCommander, SCENARIOS, GEMINI_MODEL
+from orchestrator import (
+    IncidentCommander,
+    GEMINI_MODEL,
+    REVENUE_AT_RISK_USD,
+    INTERNAL_TRANSFER_SURPLUS_UNITS,
+    AIR_FREIGHT_CAPACITY_UNITS,
+)
 from guardrails import SpendAuthorityResult, SPEND_AUTHORITY_LIMIT_USD
+
 
 
 # An event is a (kind, human_readable_message, data) triple emitted by the orchestrator.
@@ -84,14 +91,8 @@ _TOOL_PURPOSE: Dict[str, str] = {
 }
 
 
-# Friendly, non-editable scenario choices (label -> SCENARIOS key). Radio buttons, not a
-# type-to-search selectbox, so the operator can't accidentally edit the option text.
-_SCENARIO_CHOICES: List[Tuple[str, str]] = [
-    ("Internal stock available — autonomous resolution", "transfer_available"),
-    ("Internal options exhausted — escalate & negotiate", "internal_options_exhausted"),
-]
-
 # CSS to present a clean, production-style console: hide Streamlit's developer chrome (top
+
 # toolbar / Deploy button, hamburger main menu, and the "Made with Streamlit" footer). These
 # add zero value to an enterprise agent demo and look like a dev sandbox otherwise.
 _HIDE_CHROME_CSS = """
@@ -180,11 +181,12 @@ class AgentSession:
     events: List[EventTuple] = field(default_factory=list)
     # Which reasoning core actually engaged this run ("LIVE · <model>" or "OFFLINE …").
     core_mode: str = ""
-    # The scenario key the currently-displayed run used — so the UI can auto-clear a stale
-    # flow when the operator picks a different scenario without pressing Reset first.
-    run_scenario: str = ""
+    # The (order_qty, delay) the currently-displayed run used — so the UI can auto-clear a
+    # stale flow when the operator changes an input without pressing Reset first.
+    run_params: Tuple[int, int] = (0, 0)
     # Last STORE revision the UI observed — used by the stale-snapshot convergence guard.
     last_revision: int = -1
+
 
 
 
@@ -292,8 +294,9 @@ def _start(sess: AgentSession, params: Dict[str, Any]) -> None:
     sess.error = None
 
     # Establish the single source of truth up front (UI thread) — the worker thread will only
-    # read/mutate it, never (re-)create it.
-    scenario = SCENARIOS.get(params["scenario"], SCENARIOS["transfer_available"])
+    # read/mutate it, never (re-)create it. The agent's strategy EMERGES from comparing the
+    # order quantity against the finite resources (surplus 350 / air capacity 420); the delay
+    # independently drives the dynamic projected loss (no scenario switch steers the outcome).
     STORE.init_incident(
         target_sku="SKU-99",
         primary_supplier_id="SUP-A",
@@ -302,15 +305,18 @@ def _start(sess: AgentSession, params: Dict[str, Any]) -> None:
         impacted_plants=["PLANT-2"],
         inventory_days_remaining=2,
         production_shutdown_hours=48,
-        revenue_at_risk_usd=4200.0,
-        transferable_units=scenario["transferable_units"],
-        air_freight_available=scenario["air_freight_available"],
+        revenue_at_risk_usd=REVENUE_AT_RISK_USD,
+        transferable_units=INTERNAL_TRANSFER_SURPLUS_UNITS,
+        air_freight_available=True,
+        air_freight_capacity_units=AIR_FREIGHT_CAPACITY_UNITS,
         replacement_order_qty=params["order_quantity"],
+        delay_days=params["delay_days"],
     )
 
-    # Remember which scenario this run is for, so the UI can auto-clear a stale flow if the
-    # operator later picks a different scenario without pressing Reset.
-    sess.run_scenario = str(params["scenario"])
+    # Remember the (qty, delay) this run used, so the UI can auto-clear a stale flow if the
+    # operator changes an input without pressing Reset.
+    sess.run_params = (int(params["order_quantity"]), int(params["delay_days"]))
+
 
     sess.running = True
     sess.started = True
@@ -599,26 +605,44 @@ def main() -> None:
                 "Without it, the run automatically falls back to the deterministic planner."
             )
 
-        scenario_label = st.selectbox(
-            "Scenario",
-            options=[label for label, _key in _SCENARIO_CHOICES],
-            index=0,
-            help="Internal stock available -> the agent resolves via an internal transfer "
-            "(no spend). Internal options exhausted -> the agent escalates to an alternate "
-            "supplier, negotiates, and hits the spend guardrail (human review).",
-            disabled=sess.running,
-        )
-        scenario = dict(_SCENARIO_CHOICES)[scenario_label]
-
+        # ORDER QUANTITY — the single lever the agent's strategy EMERGES from (no scenario
+        # switch). It is compared against the fixed resources below; a bigger order closes
+        # cheaper options and pushes the agent up the escalation ladder.
         order_quantity = st.number_input(
-            "Order quantity",
+            "Order quantity (units)",
             min_value=1,
             max_value=100000,
             value=500,
-            step=50,
-            help="Drives total spend (unit price x qty). ~300 stays within authority; ~500 "
-            "exceeds the $20k limit and triggers human review.",
+            step=10,
+            help=(
+                f"The agent's strategy emerges from this vs the incident resources: "
+                f"≤{INTERNAL_TRANSFER_SURPLUS_UNITS} → internal transfer (no spend); "
+                f"≤{AIR_FREIGHT_CAPACITY_UNITS} → air-freight expedite; "
+                f">{AIR_FREIGHT_CAPACITY_UNITS} → alternate supplier + negotiation. It also "
+                f"sets total spend vs the ${SPEND_AUTHORITY_LIMIT_USD:,.0f} authority."
+            ),
             disabled=sess.running,
+        )
+
+        # SHIPMENT DELAY — the second, independent lever. Drives the DYNAMIC projected loss
+        # (bigger delay => bigger exposure), decoupled from the strategy choice.
+        delay_days = st.number_input(
+            "Shipment delay (days)",
+            min_value=0,
+            max_value=60,
+            value=9,
+            step=1,
+            help="How many days the shipment has slipped. Drives the projected financial "
+            "loss (penalty accrual + post-buffer downtime) — a bigger delay means a bigger "
+            "exposure. Independent of which mitigation the agent selects.",
+            disabled=sess.running,
+        )
+
+        # Read-only incident resources so a judge can SEE why the agent chose what it did
+        # (this is the anti-steering proof: the operator sets the order size, not the answer).
+        st.caption(
+            f"Incident resources — internal surplus **{INTERNAL_TRANSFER_SURPLUS_UNITS}** · "
+            f"air capacity **{AIR_FREIGHT_CAPACITY_UNITS}** · alternate-supplier pool"
         )
 
         # The spend-authority limit is a FIXED delegated signing authority — in a real
@@ -636,12 +660,13 @@ def main() -> None:
                 sess,
                 {
                     "offline": offline,
-                    "scenario": scenario,
                     "order_quantity": int(order_quantity),
+                    "delay_days": int(delay_days),
                     "spend_limit": float(SPEND_AUTHORITY_LIMIT_USD),
                     "gemini_key": original_key,
                 },
             )
+
         if col_b.button("Reset", disabled=sess.running, use_container_width=True):
             _reset(sess)
             st.rerun()
@@ -652,13 +677,20 @@ def main() -> None:
             st.warning("No API key found — a live run will fall back to the offline planner.")
 
     # AUTO-CLEAR STALE FLOW: if a previous run is displayed (started, not running) and the
-    # operator selects a DIFFERENT scenario without pressing Reset, wipe the old flow so the
-    # UI cleanly returns to the "press Start" state for the new scenario — otherwise the old
-    # run's cards/chat linger and visually fight the next run. Only fires between runs (the
-    # scenario control is disabled while running), so it's safe.
-    if sess.started and not sess.running and not _thread_alive(sess) and scenario != sess.run_scenario:
+    # operator changes the order quantity or delay without pressing Reset, wipe the old flow
+    # so the UI cleanly returns to the "press Start" state for the new inputs — otherwise the
+    # old run's cards/chat linger and visually fight the next run. Only fires between runs
+    # (the inputs are disabled while running), so it's safe.
+    current_params = (int(order_quantity), int(delay_days))
+    if (
+        sess.started
+        and not sess.running
+        and not _thread_alive(sess)
+        and current_params != sess.run_params
+    ):
         _reset(sess)
         st.rerun()
+
 
     # ------------------------------- Header -------------------------------------------- #
 
@@ -671,12 +703,14 @@ def main() -> None:
 
     if not sess.started:
         st.info(
-            "Configure the incident in the sidebar and press **Start**. "
-            "Try *Internal stock available* first (autonomous resolution), then "
-            "*Internal options exhausted* with quantity 500 to trigger the spend guardrail "
-            "and human review."
+            "Set the **order quantity** and **shipment delay** in the sidebar, then press "
+            "**Start**. The agent's mitigation choice emerges from the quantity vs the "
+            "incident's resources: try **300** (internal transfer, no spend), **400** "
+            "(air-freight expedite), then **500** to force an alternate-supplier purchase "
+            "that breaches the spend authority and triggers human review."
         )
         return
+
 
     if sess.error:
         st.error(f"Agent error: {sess.error}")

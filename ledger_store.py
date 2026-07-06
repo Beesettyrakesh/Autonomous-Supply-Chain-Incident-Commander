@@ -84,10 +84,13 @@ class LedgerStore:
         inventory_days_remaining: int = 0,
         production_shutdown_hours: int = 0,
         revenue_at_risk_usd: float = 0.0,
-        transferable_units: int = 900,
+        transferable_units: int = 350,
         air_freight_available: bool = True,
+        air_freight_capacity_units: int = 420,
         replacement_order_qty: int = 0,
+        delay_days: int = 9,
         incident_type: str = "SUPPLIER_DELAY",
+
 
         severity: str = "CRITICAL",
         incident_id: Optional[UUID] = None,
@@ -96,12 +99,17 @@ class LedgerStore:
         Corresponds to the INIT STATE LEDGER node: sets IDs, SKUs, and LoopCount=0.
         Returns the freshly created, validated ledger.
 
-        `transferable_units` and `air_freight_available` seed the mitigation FEASIBILITY
-        signals (which options are even possible this incident) — these gate strategy
-        SELECTION deterministically, independent of the desirability scores. The default
-        scenario keeps INTERNAL_TRANSFER viable; a depleted scenario zeroes them so the
-        agent must organically escalate to ALT_SUPPLIER (negotiation + guardrail + HITL).
+        `transferable_units`, `air_freight_available`, and `air_freight_capacity_units` seed
+        the mitigation FEASIBILITY signals (which options are even possible this incident) —
+        these gate strategy SELECTION deterministically, independent of the desirability
+        scores. The agent's choice EMERGES from comparing the required `replacement_order_qty`
+        against these finite resources (no scenario switch): a small order is covered by the
+        internal transfer surplus; a larger one exceeds it and is expedited by air; a still
+        larger one exceeds even the air capacity and must be sourced from an ALTERNATE supplier
+        (negotiation + spend-authority guardrail + HITL). `delay_days` seeds the observed
+        shipment slip that drives the dynamic financial-exposure computation in simulate_finance.
         """
+
         with self._lock:
             ledger = StateLedger(
                 metadata=IncidentMetadata(
@@ -123,8 +131,11 @@ class LedgerStore:
                     revenue_at_risk_usd=revenue_at_risk_usd,
                     transferable_units=transferable_units,
                     air_freight_available=air_freight_available,
+                    air_freight_capacity_units=air_freight_capacity_units,
                     replacement_order_qty=replacement_order_qty,
+                    delay_days=delay_days,
                 ),
+
 
                 mitigation=MitigationState(),
                 status=SystemStatus(),
