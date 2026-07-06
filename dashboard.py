@@ -706,14 +706,8 @@ def main() -> None:
             disabled=sess.running,
         )
 
-        # Read-only incident resources so a judge can SEE why the agent chose what it did
-        # (this is the anti-steering proof: the operator sets the order size, not the answer).
-        st.caption(
-            f"Incident resources — internal surplus **{INTERNAL_TRANSFER_SURPLUS_UNITS}** · "
-            f"air capacity **{AIR_FREIGHT_CAPACITY_UNITS}** · alternate-supplier pool"
-        )
-
         # The spend-authority limit is a FIXED delegated signing authority — in a real
+
         # enterprise it's set by senior management and locked, not re-tuned per incident. So
         # we display it as a read-only notice rather than an editable field; the constant is
         # passed straight through to the agent.
