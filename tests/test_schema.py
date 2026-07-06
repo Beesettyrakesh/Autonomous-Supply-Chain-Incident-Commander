@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from pydantic import ValidationError
 
@@ -11,14 +13,14 @@ from ledger_store import STORE
 
 def test_loop_count_accepts_10_rejects_12() -> None:
     """loop_count is bounded le=11; the circuit breaker escalates past 10."""
-    IncidentMetadata(id=__import__("uuid").uuid4(), loop_count=10)  # ok
+    IncidentMetadata(id=uuid.uuid4(), loop_count=10)  # ok
     with pytest.raises(ValidationError):
-        IncidentMetadata(id=__import__("uuid").uuid4(), loop_count=12)
+        IncidentMetadata(id=uuid.uuid4(), loop_count=12)
 
 
 def test_loop_count_rejects_negative() -> None:
     with pytest.raises(ValidationError):
-        IncidentMetadata(id=__import__("uuid").uuid4(), loop_count=-1)
+        IncidentMetadata(id=uuid.uuid4(), loop_count=-1)
 
 
 def test_invalid_active_strategy_rejected() -> None:
@@ -28,7 +30,7 @@ def test_invalid_active_strategy_rejected() -> None:
 
 def test_invalid_severity_rejected() -> None:
     with pytest.raises(ValidationError):
-        IncidentMetadata(id=__import__("uuid").uuid4(), severity="EXTREME")  # type: ignore[arg-type]
+        IncidentMetadata(id=uuid.uuid4(), severity="EXTREME")  # type: ignore[arg-type]
 
 
 def test_default_metrics_seed() -> None:

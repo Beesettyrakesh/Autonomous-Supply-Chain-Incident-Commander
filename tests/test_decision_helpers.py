@@ -37,6 +37,20 @@ def test_simulate_finance_delay_0_no_downtime() -> None:
     assert r["projected_total_loss_usd"] == 75000.0
 
 
+def test_simulate_finance_fallback_to_ledger() -> None:
+    """delay_days=None falls back to the ledger's observed slip (the offline-planner path).
+
+    The orchestrator's offline planner calls simulate_finance with empty args, so the
+    None -> metrics.delay_days fallback is the production path. Assert it reads the snapshot's
+    baseline delay (9) and reproduces the frozen $357,750 loss — a direct regression guard for
+    a bug that previously computed the loss off a missing delay.
+    """
+    snapshot = {**_SNAPSHOT, "metrics": {**_SNAPSHOT["metrics"], "delay_days": 9}}
+    r = simulate_finance(delay_days=None, state_ledger_snapshot=snapshot)
+    assert r["delay_days"] == 9
+    assert r["projected_total_loss_usd"] == 357750.0
+
+
 def test_score_alt_supplier() -> None:
     assert score_strategy("ALT_SUPPLIER", _SNAPSHOT)["composite_score"] == 60.35
 

@@ -171,10 +171,10 @@ The full suite runs offline — no API key, deterministic planner, scripted vend
 
 ```bash
 GEMINI_API_KEY="" VENDOR_MODE=deterministic .venv/bin/python -m pytest -q
-# → 51 passed
+# → 52 passed
 ```
 
-**51 tests across 9 modules** cover the schema/Literal locks, the State Mutation Layer, the five MCP tools and the three-server split, the Decision Helper formulas, the guardrails, the negotiation state machine, the feasibility ladder + HITL paths, the CLI, and the resilience/retry policy. This includes a **real MCP client↔server integration test** that spawns all three servers and invokes their tools over stdio.
+**52 tests across 9 modules** cover the schema/Literal locks, the State Mutation Layer, the five MCP tools and the three-server split, the Decision Helper formulas, the guardrails, the negotiation state machine, the feasibility ladder + HITL paths, the CLI, and the resilience/retry policy. This includes a **real MCP client↔server integration test** that spawns all three servers and invokes their tools over stdio.
 
 ---
 

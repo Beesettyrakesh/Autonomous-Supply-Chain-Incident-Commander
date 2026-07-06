@@ -368,7 +368,7 @@ OSCAR is built directly on the `google-genai` SDK, giving full control over the 
 ├── dashboard.py               # Streamlit cockpit (observational)
 ├── agent_cli.py               # terminal operator console (Agent CLI)
 ├── contract_CTR-4471.txt      # supplier contract (3.0% per-diem penalty clause)
-├── tests/                     # 51 offline pytest tests across 9 modules
+├── tests/                     # 52 offline pytest tests across 9 modules
 └── docs/
     └── ARCHITECTURE_DESIGN.md # this document
 ```
@@ -377,7 +377,7 @@ OSCAR is built directly on the `google-genai` SDK, giving full control over the 
 
 ## 14. Testing
 
-OSCAR ships with **51 offline tests** across **9 modules**, all runnable without an API key (deterministic planner + scripted vendor + in-process MCP transport).
+OSCAR ships with **52 offline tests** across **9 modules**, all runnable without an API key (deterministic planner + scripted vendor + in-process MCP transport).
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -385,7 +385,7 @@ OSCAR ships with **51 offline tests** across **9 modules**, all runnable without
 | `test_ledger_store.py` | 5 | Mutation re-validation, deep-copy snapshots, revision counter, raw-log sanitization. |
 | `test_mcp_tools.py` | 7 | The 5 tools and the 3-server split. |
 | `test_mcp_client.py` | 3 | Real MCP client↔server over stdio + in-process invoker + end-to-end run over stdio. |
-| `test_decision_helpers.py` | 8 | `simulate_finance` formula, `score_strategy` outputs, `policy_check`. |
+| `test_decision_helpers.py` | 9 | `simulate_finance` formula (incl. the None→ledger fallback), `score_strategy` outputs, `policy_check`. |
 | `test_guardrails.py` | 6 | Spend-authority outcomes and recursive injection sanitization. |
 | `test_negotiation.py` | 4 | Turn-limited state machine, per-vendor floors, outcome parsing. |
 | `test_orchestrator_paths.py` | 6 | Feasibility ladder, commit backstop, HITL approve/reject paths. |
@@ -396,7 +396,7 @@ OSCAR ships with **51 offline tests** across **9 modules**, all runnable without
 
 ```bash
 GEMINI_API_KEY="" VENDOR_MODE=deterministic .venv/bin/python -m pytest -q
-# → 51 passed
+# → 52 passed
 ```
 
 **Verify the agent end-to-end (offline):**
