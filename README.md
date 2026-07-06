@@ -2,6 +2,8 @@
 
 > An enterprise AI agent that takes ownership of a critical procurement incident and drives it to resolution — assessing exposure, choosing the feasible-and-optimal mitigation, negotiating a purchase order, and enforcing spend authority — escalating to a human only when a decision genuinely exceeds its delegated authority.
 
+**Agents for Business** · OSCAR collapses a multi-hour, multi-system manual triage into a sub-minute autonomous decision — with a hard financial guardrail and human sign-off on over-limit spend.
+
 ---
 
 ## The Problem
