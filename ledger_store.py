@@ -1,20 +1,12 @@
 """
-ledger_store.py
-===============
 In-memory storage driver for the State Ledger.
 
-This module is the concrete implementation of the "single source of truth" storage
-concept described in Section 3. It holds exactly one live `StateLedger` instance per
-incident and mediates ALL mutations to it. Components in the graph must never mutate
-the ledger by passing ad-hoc objects around — they go through this store, which is the
-seat of the State Mutation Layer's contract.
-
-Guarantees provided here:
-- Only typed primitives that survive Pydantic validation can enter the ledger.
-- Every mutation increments an internal revision counter for auditability.
-- Raw / unstructured tool output is NEVER stored here; it is appended to the external
-  `incident_execution.log` via `append_raw_log()` and is not natively readable by the
-  Orchestrator (Section 3.2).
+Holds exactly one live `StateLedger` per incident and mediates all mutations to it, so the
+ledger is the single source of truth. Guarantees:
+- Only typed primitives that pass Pydantic validation can enter the ledger.
+- Every mutation increments a revision counter for auditability.
+- Raw/unstructured tool output never enters the ledger; it goes to the isolated
+  `incident_execution.log` via `append_raw_log()`.
 """
 
 from __future__ import annotations
@@ -29,7 +21,6 @@ from typing import Any, Callable, Dict, Optional, cast
 from uuid import UUID, uuid4
 
 
-
 from schema import (
     StateLedger,
     IncidentMetadata,
@@ -39,35 +30,28 @@ from schema import (
     SystemStatus,
 )
 
-# Isolated raw-detail sink. The Orchestrator cannot read this natively (Section 3.2).
+# Isolated raw-detail sink; not natively readable by the orchestrator.
 RAW_LOG_PATH = Path(__file__).parent / "incident_execution.log"
 
-# Control characters that must NEVER reach the flat audit log verbatim. Adversarial input
-# (e.g. an injection blob, a poisoned vendor reply) could otherwise embed carriage returns /
-# line feeds (\r \n) to FORGE fake log lines, or ANSI/ESC sequences to hide/rewrite terminal
-# output when the log is `cat`-ed. We neutralize ALL C0 control bytes (0x00-0x1f — this
-# INCLUDES tab, CR, LF and ESC) plus DEL (0x7f) at the single write boundary, so every call
-# site is protected (log-forging defense, §5.1). The record's only newline is the trailing
-# "\n" the writer appends itself.
+# Control characters neutralized before writing to the audit log. Stripping C0 bytes
+# (0x00-0x1f, incl. CR/LF/ESC) plus DEL (0x7f) prevents log forging (CR/LF injecting fake
+# lines) and terminal corruption (ANSI/ESC sequences) from adversarial input. Applied at the
+# single write boundary so every call site is protected.
 _LOG_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-
 
 
 class LedgerStore:
     """
     Thread-safe, in-memory holder + mutator for a single incident's StateLedger.
 
-    A callback hook (`on_mutation`) is exposed so downstream watchers — e.g. the
-    Streamlit dashboard or the async negotiation callback — can react to state changes
-    without polling.
+    An `on_mutation` callback lets downstream watchers (dashboard, negotiation callback)
+    react to state changes without polling.
     """
 
     def __init__(self) -> None:
         self._ledger: Optional[StateLedger] = None
         self._revision: int = 0
         self._lock = threading.RLock()
-        # Optional observer invoked after every successful mutation.
         self.on_mutation: Optional[Callable[[StateLedger, int], None]] = None
 
     # ------------------------------------------------------------------ #
@@ -96,18 +80,11 @@ class LedgerStore:
         incident_id: Optional[UUID] = None,
     ) -> StateLedger:
         """
-        Corresponds to the INIT STATE LEDGER node: sets IDs, SKUs, and LoopCount=0.
-        Returns the freshly created, validated ledger.
+        Create and store a fresh, validated ledger (loop_count=0).
 
         `transferable_units`, `air_freight_available`, and `air_freight_capacity_units` seed
-        the mitigation FEASIBILITY signals (which options are even possible this incident) —
-        these gate strategy SELECTION deterministically, independent of the desirability
-        scores. The agent's choice EMERGES from comparing the required `replacement_order_qty`
-        against these finite resources (no scenario switch): a small order is covered by the
-        internal transfer surplus; a larger one exceeds it and is expedited by air; a still
-        larger one exceeds even the air capacity and must be sourced from an ALTERNATE supplier
-        (negotiation + spend-authority guardrail + HITL). `delay_days` seeds the observed
-        shipment slip that drives the dynamic financial-exposure computation in simulate_finance.
+        the mitigation feasibility signals; `delay_days` seeds the observed shipment slip that
+        drives the dynamic financial exposure. Returns the newly created ledger.
         """
 
         with self._lock:
@@ -150,11 +127,7 @@ class LedgerStore:
     # Reads
     # ------------------------------------------------------------------ #
     def snapshot(self) -> StateLedger:
-        """
-        Return a deep copy of the current ledger. Callers get an immutable-by-convention
-        view: mutating the returned object never affects stored state — the only way to
-        change state is via `mutate()`.
-        """
+        """Return a deep copy of the current ledger; mutating it never affects stored state."""
         with self._lock:
             if self._ledger is None:
                 raise RuntimeError("No active incident. Call init_incident() first.")
@@ -175,20 +148,16 @@ class LedgerStore:
         """
         Apply a partial, nested update to the ledger.
 
-        `patch` is a nested dict keyed by top-level section, e.g.:
-            {"metrics": {"revenue_at_risk_usd": 4200.0},
-             "mitigation": {"active_strategy": "ALT_SUPPLIER"}}
-
-        The merged result is re-validated through the full Pydantic model, so any value
-        that violates a type or Literal constraint raises and the mutation is rejected —
-        this is the deterministic enforcement point for the State Mutation Layer.
+        `patch` is a nested dict keyed by top-level section, e.g.
+        `{"metrics": {"revenue_at_risk_usd": 4200.0}}`. The merged result is re-validated
+        through the full Pydantic model, so any value violating a type/Literal constraint
+        raises and the mutation is rejected — the deterministic State Mutation Layer enforcement point.
         """
         with self._lock:
             if self._ledger is None:
                 raise RuntimeError("No active incident. Call init_incident() first.")
 
             merged = self._deep_merge(self._ledger.model_dump(), patch)
-            # Re-validate the entire ledger; rejects bad primitives atomically.
             validated = StateLedger.model_validate(merged)
             self._ledger = validated
             self._revision += 1
@@ -196,27 +165,24 @@ class LedgerStore:
             return self.snapshot()
 
     def increment_loop(self) -> StateLedger:
-        """Convenience mutation used by the UPDATE STATE LEDGER node (LoopCount++)."""
+        """Increment loop_count (the UPDATE STATE LEDGER node)."""
         current = self.snapshot()
         return self.mutate(
             {"metadata": {"loop_count": current.metadata.loop_count + 1}}
         )
 
     # ------------------------------------------------------------------ #
-    # Raw log sink (Section 3.2) — never enters the ledger
+    # Raw log sink — never enters the ledger
     # ------------------------------------------------------------------ #
     @staticmethod
     def append_raw_log(source: str, raw_payload: str) -> None:
         """
-        Append verbose / unstructured tool output to the isolated execution log.
-        The Orchestrator cannot read this natively; only an explicit lookup tool may.
+        Append verbose/unstructured tool output to the isolated execution log.
 
-        SECURITY (log-forging defense, §5.1): both `source` and `raw_payload` may carry
-        adversarial content (LLM output, vendor replies, blocked injection blobs). We strip
-        embedded control characters — CR/LF (which would forge extra log lines) and ANSI/ESC
-        sequences (which would corrupt terminal rendering) — BEFORE writing. This is the
-        single write boundary, so EVERY call site is protected here (not per-f-string). The
-        record still occupies exactly one line; the trailing "\\n" is the only newline.
+        Both `source` and `raw_payload` may carry adversarial content (LLM output, vendor
+        replies, blocked injection blobs), so embedded control characters are stripped before
+        writing — this is the single write boundary, so every call site is protected against
+        log forging and terminal corruption. The trailing "\\n" is the only newline in a record.
         """
         timestamp = datetime.now(timezone.utc).isoformat()
         safe_source = _LOG_CONTROL_CHARS_RE.sub(" ", str(source))
@@ -228,12 +194,10 @@ class LedgerStore:
     async def append_raw_log_async(source: str, raw_payload: str) -> None:
         """Non-blocking variant of `append_raw_log` for use inside async coroutines.
 
-        The synchronous `append_raw_log` does a blocking file write. Called from within the
-        concurrent negotiation sub-graphs (multiple vendors under `asyncio.gather`), a raw
-        blocking write would briefly stall the event loop and serialize otherwise-concurrent
-        LLM network calls. This wrapper offloads the write to a worker thread via
-        `asyncio.to_thread`, keeping the loop free so simultaneous vendor calls stay truly
-        concurrent. Same control-char sanitization applies (it reuses `append_raw_log`).
+        Offloads the blocking file write to a worker thread so the event loop stays free —
+        important inside the concurrent negotiation sub-graphs, where a blocking write would
+        serialize otherwise-concurrent vendor LLM calls. Reuses `append_raw_log`, so the same
+        control-char sanitization applies.
         """
         await asyncio.to_thread(LedgerStore.append_raw_log, source, raw_payload)
 
@@ -254,7 +218,6 @@ class LedgerStore:
         for key, value in patch.items():
             existing = result.get(key)
             if isinstance(existing, dict) and isinstance(value, dict):
-                # Explicit casts keep the recursive call fully typed for strict checkers.
                 result[key] = LedgerStore._deep_merge(
                     cast(Dict[str, Any], existing), cast(Dict[str, Any], value)
                 )

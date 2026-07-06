@@ -1,24 +1,17 @@
 """
-mcp_server.py
-=============
-Model Context Protocol (MCP) Server exposing the *Observation Tools* (Section 4.1).
+MCP Server exposing the Observation Tools.
 
-These are the I/O-bound functions that query environmental reality. Per the architecture,
-ALL observation tools must be surfaced to the Incident Commander orchestrator through a
-dedicated MCP server — this demonstrates advanced tool-ecosystem design and keeps the
-orchestrator decoupled from the underlying mock enterprise systems.
+These I/O-bound functions query environmental reality (ERP, inventory, shipment tracking,
+contract rules, alternate suppliers). Surfacing them through a dedicated MCP server keeps
+the orchestrator decoupled from the underlying (mock) enterprise systems.
 
-Contract for every tool here:
+Tool contract:
 - Accept strictly-typed scalar inputs.
 - Return strictly-typed JSON-serializable dicts (never raw prose or markdown).
-- Push verbose / raw source payloads to the isolated `incident_execution.log` via the
-  LedgerStore raw-log sink, NOT into the return value that reaches the ledger.
+- Push verbose/raw source payloads to `incident_execution.log`, not into the return value.
 
-Transport:
-- Built on the official `mcp` package using FastMCP. If `mcp` is not installed, the module
-  still imports cleanly and the underlying `_query_*` implementations remain directly
-  callable/unit-testable — the MCP decorators are applied only when the package is present.
-- Run as a server with:  `python mcp_server.py`
+Built on `mcp` (FastMCP). If `mcp` is not installed the module still imports cleanly and the
+underlying `_query_*` implementations remain directly callable/testable. Run: `python mcp_server.py`.
 """
 
 from __future__ import annotations
@@ -29,9 +22,7 @@ from typing import Any, Dict
 
 from ledger_store import LedgerStore
 
-# Mock enterprise datasets live in the dedicated tools/ package (Section 4.1 separation of
-# tool transport from mock data). Imported here and aliased to the module-private names the
-# query functions use, so the observation-tool logic is unchanged.
+# Mock datasets live in the tools/ package, keeping tool transport separate from mock data.
 from tools.mock_data import ERP_DB as _ERP_DB
 from tools.mock_data import INVENTORY_DB as _INVENTORY_DB
 from tools.mock_data import SHIPMENT_DB as _SHIPMENT_DB
@@ -39,19 +30,18 @@ from tools.mock_data import SHIPMENT_DB as _SHIPMENT_DB
 # Directory the observation tools resolve local mock artifacts (e.g. contract files) from.
 _MODULE_DIR = Path(__file__).parent
 
-# Tight, explicit return contract for the public observation tools. Values are limited to
-# scalars, a list of strings, or a shallow {str: int} map (e.g. plant balances) — no `Any`.
+# Return contract for the primary observation tools: scalars, a list of strings, or a shallow
+# {str: int} map (e.g. plant balances) — no `Any`.
 ToolResult = dict[str, str | int | float | bool | list[str] | dict[str, int]]
 
-# Return contract for the alternate-supplier discovery tool: a LIST of flat vendor records
-# (a distinct capability/shape from the primary PO lookup, hence its own tool + type).
+# Return contract for alternate-supplier discovery: a list of flat vendor records.
 SupplierRecord = dict[str, str | int | float]
 SupplierListResult = list[SupplierRecord]
 
 
 # ---------------------------------------------------------------------------- #
-# Core implementations (framework-agnostic, unit-testable).
-# Each strips verbose context into the raw log and returns strict primitives only.
+# Core implementations (framework-agnostic, unit-testable). Each pushes verbose context
+# to the raw log and returns strict primitives only.
 # ---------------------------------------------------------------------------- #
 def _query_erp(sku_id: str) -> Dict[str, Any]:
     """Pull active PO records, vendor master files, and base lead-time frameworks."""
@@ -60,7 +50,6 @@ def _query_erp(sku_id: str) -> Dict[str, Any]:
         LedgerStore.append_raw_log("query_erp", f"MISS sku_id={sku_id}")
         return {"found": False, "sku_id": sku_id}
 
-    # Verbose vendor master detail is logged out-of-band, not returned to the ledger.
     LedgerStore.append_raw_log("query_erp", f"vendor_master={record['vendor_master']}")
     return {
         "found": True,
@@ -116,12 +105,9 @@ def _query_shipment_tracking(po_id: str) -> Dict[str, Any]:
 
 
 def _query_alternate_suppliers(sku_id: str) -> list[Dict[str, Any]]:
-    """
-    Discover APPROVED alternate vendors that can fulfil this SKU (the ALT_SUPPLIER path).
+    """Discover approved alternate vendors that can fulfil this SKU (the ALT_SUPPLIER path).
 
-    A distinct capability from `query_erp` (which answers "what is my current PO?"): this
-    answers "who else can supply this?" and returns a LIST of flat vendor records. Modeled
-    as its own MCP query tool, mirroring how a real ERP exposes purpose-specific endpoints.
+    Returns a list of flat vendor records with only the scalar fields the negotiation needs.
     """
     record = _ERP_DB.get(sku_id) or {}
     alternates = record.get("alternate_suppliers", [])
@@ -129,7 +115,6 @@ def _query_alternate_suppliers(sku_id: str) -> list[Dict[str, Any]]:
         "query_alternate_suppliers",
         f"sku_id={sku_id} count={len(alternates)}",
     )
-    # Return only the flat scalar fields each downstream consumer (negotiation) needs.
     return [
         {
             "supplier_id": str(a["supplier_id"]),
@@ -150,13 +135,10 @@ _PENALTY_CLAUSE_RE = re.compile(
 
 
 def _extract_contract_rules(contract_id: str) -> Dict[str, Any]:
-    """
-    Read the local `contract_{contract_id}.txt` file and extract the deterministic
-    primitive we care about: the per-diem late-delivery penalty rate.
+    """Read `contract_{contract_id}.txt` and extract the per-diem late-delivery penalty rate.
 
-    The full messy contract text is verbose and unstructured, so ONLY the parsed numeric
-    primitive is returned to the ledger — the raw file body is pushed to the isolated
-    execution log (Section 3.2), never bled into the State Ledger.
+    The full contract body is verbose, so only the parsed numeric primitive is returned; the
+    raw text is pushed to the isolated execution log.
     """
     contract_path = _MODULE_DIR / f"contract_{contract_id}.txt"
     if not contract_path.exists():
@@ -166,7 +148,6 @@ def _extract_contract_rules(contract_id: str) -> Dict[str, Any]:
         return {"found": False, "contract_id": contract_id}
 
     raw_text = contract_path.read_text(encoding="utf-8")
-    # Verbose raw contract body logged out-of-band; only primitives reach the ledger.
     LedgerStore.append_raw_log(
         "extract_contract_rules",
         f"contract_id={contract_id} bytes={len(raw_text)} raw={raw_text!r}",
@@ -186,8 +167,8 @@ def _extract_contract_rules(contract_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------- #
-# MCP Server wiring (FastMCP). Applied only if the `mcp` package is available so the
-# module remains importable in constrained/test environments.
+# MCP Server wiring (FastMCP). Applied only if the `mcp` package is available so the module
+# remains importable in constrained/test environments.
 # ---------------------------------------------------------------------------- #
 try:
     from mcp.server.fastmcp import FastMCP
@@ -196,12 +177,11 @@ try:
 except ImportError:  # pragma: no cover - graceful degradation when mcp not installed
     _FastMCP = None
 
-# Assigned exactly once at module level (no constant redefinition across branches).
 MCP_AVAILABLE = _FastMCP is not None
 mcp_server = _FastMCP("supply-chain-observation-tools") if _FastMCP is not None else None
 
 
-# Public tool functions are ALWAYS defined so callers/tests work with or without `mcp`.
+# Public tool functions are always defined so callers/tests work with or without `mcp`.
 def query_erp(sku_id: str) -> ToolResult:
     """MCP tool: active purchase order records, vendor master, base lead-time."""
     return _query_erp(sku_id)
