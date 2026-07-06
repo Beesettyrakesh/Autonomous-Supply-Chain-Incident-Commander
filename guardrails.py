@@ -1,28 +1,19 @@
 """
-guardrails.py
-=============
-Deterministic, code-enforced safety barriers (Section 5). The LLM has NO control over any
-of these — they intercept the execution path AFTER the State Mutation Layer commits a
-change, exactly as the architecture requires.
+Deterministic, code-enforced safety barriers.
 
-This module is intentionally isolated (pure functions + small dataclasses, no orchestrator
-imports) so every barrier is independently unit-testable and reusable by the CLI and the
-Streamlit dashboard.
+The LLM has no control over these; they intercept the execution path after the State
+Mutation Layer commits a change. The module is dependency-light (pure functions + small
+dataclasses, no orchestrator imports) so each barrier is independently testable and reusable
+by the CLI and dashboard.
 
-Barriers implemented here:
-  1. Financial Spend-Authority Guardrail (§5.2)
-     - Models a procurement manager's FIXED delegated approval authority.
-     - The realistic per-incident variable is the ORDER QUANTITY (hence total spend), not
-       the limit. Spend <= limit -> agent may auto-approve; spend > limit -> pause for a
-       HUMAN-IN-THE-LOOP (HITL) approve/reject decision.
-  2. Jailbreak / Injection Sanitization (§5.1)
-     - A regex + length-boundary scan applied to any parameter destined for a write action
-       (e.g. committing a strategy / persisting negotiated terms). A hit ABORTS the write.
+Barriers:
+  1. Financial Spend-Authority Guardrail — spend <= limit may be auto-approved; spend above
+     it pauses for a human-in-the-loop (HITL) approve/reject decision.
+  2. Jailbreak / Injection Sanitization — a regex + length-boundary scan applied to any
+     parameter destined for a write action; a hit aborts the write.
 
-Configuration:
-  - The spend-authority limit is FIXED policy (default $20,000) but overridable via the
-    `SPEND_AUTHORITY_LIMIT_USD` environment variable so judges can retune it for a demo
-    without code edits. The realistic demo variable remains the order quantity.
+The spend-authority limit defaults to $20,000 and is overridable via the
+`SPEND_AUTHORITY_LIMIT_USD` environment variable.
 """
 
 from __future__ import annotations
@@ -33,12 +24,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, cast
 
 
-
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 def _load_spend_authority_limit() -> float:
-    """Read the delegated spend-authority limit (USD). Fixed policy; env-overridable."""
+    """Read the delegated spend-authority limit (USD); fixed policy, env-overridable."""
     raw = os.environ.get("SPEND_AUTHORITY_LIMIT_USD", "20000")
     try:
         return float(raw)
@@ -46,23 +36,23 @@ def _load_spend_authority_limit() -> float:
         return 20000.0
 
 
-# Delegated approval authority: spend at or below this may be auto-approved by the agent;
-# spend above it must be escalated to a human (HITL). A procurement manager's signing limit.
+# Delegated approval authority: spend at or below this may be auto-approved; above it is
+# escalated to a human (HITL).
 SPEND_AUTHORITY_LIMIT_USD: float = _load_spend_authority_limit()
 
 
 # --------------------------------------------------------------------------- #
-# 1. Financial Spend-Authority Guardrail (§5.2)
+# 1. Financial Spend-Authority Guardrail
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class SpendAuthorityResult:
     """Outcome of a spend-authority check — flat, ledger-safe primitives only."""
 
-    within_authority: bool          # True -> agent may auto-approve; False -> needs HITL
-    spend_usd: float                # the evaluated total spend (unit price * qty)
-    limit_usd: float                # the delegated authority limit checked against
+    within_authority: bool          # True -> auto-approve; False -> needs HITL
+    spend_usd: float                # evaluated total spend (unit price * qty)
+    limit_usd: float                # delegated authority limit checked against
     supplier_id: str                # the vendor the spend is with
-    reason: str                     # human-readable explanation (for the escalation record)
+    reason: str                     # human-readable explanation for the record
 
 
 def check_spend_authority(
@@ -74,14 +64,13 @@ def check_spend_authority(
     """
     Evaluate whether a negotiated purchase is within the agent's delegated spend authority.
 
-    Wraps `decision_helpers.policy_check` (approved-vendor + spend-cap compliance) so there
-    is a single source of truth for the compliance rule, and enriches the boolean into a
-    structured result the orchestrator can act on and log.
+    Wraps `decision_helpers.policy_check` (approved-vendor + spend-cap compliance) as the
+    single source of truth for the rule, and enriches the boolean into a structured result.
 
     Args:
-        supplier_id: The winning vendor the purchase order would be placed with.
+        supplier_id: The winning vendor the PO would be placed with.
         unit_price_usd: The negotiated per-unit price.
-        quantity: The order quantity (the realistic per-incident variable).
+        quantity: The order quantity.
         limit_usd: The delegated authority limit (defaults to the configured policy limit).
 
     Returns:
@@ -116,32 +105,28 @@ def check_spend_authority(
 
 
 # --------------------------------------------------------------------------- #
-# 2. Jailbreak / Injection Sanitization (§5.1)
+# 2. Jailbreak / Injection Sanitization
 # --------------------------------------------------------------------------- #
 class InjectionAttemptError(ValueError):
     """Raised when a write-bound payload contains a prompt-injection / escape pattern.
 
-    The orchestrator catches this and converts it into a recoverable error Observation —
-    the write is aborted, the transaction cancelled, and the loop continues safely.
+    The orchestrator catches this and converts it into a recoverable error Observation: the
+    write is aborted, the transaction cancelled, and the loop continues safely.
     """
 
 
-# Maximum accepted length for a system-identifier string destined for a write action
-# (strategy names, supplier ids, tool args). These are short by design, so a long blob here
-# is inherently suspect — keep the bound tight.
+# Max length for a system-identifier string destined for a write action (strategy names,
+# supplier ids, tool args). These are short by design, so a long blob here is suspect.
 MAX_WRITE_STRING_LEN = 100
 
-# Separate, looser bound for legitimate NATURAL-LANGUAGE fields (e.g. a Supplier-Persona's
-# raw reply, which is "one or two short sentences"). Two real sentences routinely exceed 100
-# chars, so scanning them with the strict identifier bound would false-positive and reject
-# benign live replies. Callers pass this via `max_len` ONLY for genuine NL text; the regex
-# injection patterns still apply, so real prompt-injection payloads are blocked regardless
-# of length.
+# Looser bound for legitimate natural-language fields (e.g. a vendor's raw reply), which can
+# exceed 100 chars. Callers pass this via `max_len` only for genuine NL text; the injection
+# regex still applies, so injection payloads are blocked regardless of length.
 MAX_NL_STRING_LEN = 500
 
 
-# Patterns that should NEVER appear in a legitimate write parameter. These target common
-# prompt-injection / command-injection / escape techniques rather than business values.
+# Patterns that should never appear in a legitimate write parameter — common
+# prompt-injection / command-injection / escape techniques, not business values.
 _INJECTION_PATTERNS = (
     re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions", re.IGNORECASE),
     re.compile(r"disregard\s+(?:the\s+)?(?:system|previous)", re.IGNORECASE),
@@ -158,9 +143,8 @@ _INJECTION_PATTERNS = (
 def _scan_string(value: str, field: str, max_len: int = MAX_WRITE_STRING_LEN) -> None:
     """Raise InjectionAttemptError if `value` is over-length or matches an injection pattern.
 
-    `max_len` defaults to the strict identifier bound; NL callers pass MAX_NL_STRING_LEN.
-    The injection-pattern regex scan ALWAYS runs regardless of the length bound, so a longer
-    allowance never weakens payload-content detection.
+    The injection regex scan always runs regardless of the length bound, so a looser NL
+    length allowance never weakens content detection.
     """
     if len(value) > max_len:
         raise InjectionAttemptError(
@@ -175,62 +159,46 @@ def _scan_string(value: str, field: str, max_len: int = MAX_WRITE_STRING_LEN) ->
 
 
 def _sanitize_value(field: str, value: Any, max_len: int = MAX_WRITE_STRING_LEN) -> None:
-    """Recursively scan a single value of ANY shape for injection/escape patterns (§5.1).
+    """Recursively scan a value of any shape for injection/escape patterns.
 
-    Strings are scanned directly; dicts recurse over their values (and stringified keys);
-    lists/tuples recurse over their elements. Non-string scalars (numbers, bools, None) are
-    inert and pass through untouched. Handling lists is critical: an attacker could smuggle a
-    prompt-override as a list element (e.g. {"x": ["ignore all previous instructions"]}) — a
-    string-and-dict-only scanner would silently miss it. This closes that bypass.
-
-    `max_len` (default = strict identifier bound) applies to every string scanned in this
-    subtree; NL callers pass MAX_NL_STRING_LEN so conversational text isn't false-flagged on
-    length alone. Dict KEYS keep the strict identifier bound regardless (keys are never NL).
+    Strings are scanned directly; dicts recurse over values and stringified keys; lists and
+    tuples recurse over elements (closing the bypass of smuggling an override as a list
+    element). Non-string scalars are inert. Dict keys always use the strict identifier bound.
     """
     if isinstance(value, str):
         _scan_string(value, field, max_len)
     elif isinstance(value, dict):
         for k, v in cast(Dict[Any, Any], value).items():
-            # A malicious KEY is as dangerous as a malicious value — scan both. Keys are
-            # identifiers, so they always use the strict default bound.
             _scan_string(str(k), f"{field}.<key>")
             _sanitize_value(f"{field}.{k}", v, max_len)
     elif isinstance(value, (list, tuple)):
         for i, item in enumerate(cast(Any, value)):
             _sanitize_value(f"{field}[{i}]", item, max_len)
-    # else: inert scalar (int/float/bool/None) — nothing to scan.
 
 
 def sanitize_write_payload(
     payload: Dict[str, Any], max_len: int = MAX_WRITE_STRING_LEN
 ) -> Dict[str, Any]:
     """
-    Scan every value in a write-bound payload for injection/escape patterns and
-    length-boundary violations BEFORE it is allowed to mutate the ledger (§5.1).
+    Scan every value in a write-bound payload for injection/escape patterns and length
+    violations before it is allowed to mutate the ledger.
 
-    Handles arbitrarily-nested structures via `_sanitize_value`: strings, dicts (values AND
-    keys), and LISTS/tuples are all traversed; non-string scalars pass through untouched. On
-    any violation an InjectionAttemptError is raised so the caller aborts the write and
-    cancels the transaction.
+    Handles arbitrarily-nested structures (strings, dict values and keys, lists/tuples). On
+    any violation an InjectionAttemptError is raised so the caller aborts the write.
 
     Args:
         payload: The dict of parameters destined for a write/commit action.
-        max_len: Per-string length bound. Defaults to the strict identifier bound
-            (MAX_WRITE_STRING_LEN=100). Pass MAX_NL_STRING_LEN for genuine natural-language
-            fields (e.g. a vendor's raw reply) so benign multi-sentence text isn't rejected
-            on length — the injection-pattern regex still applies either way.
+        max_len: Per-string length bound. Defaults to the strict identifier bound; pass
+            MAX_NL_STRING_LEN for genuine natural-language fields.
 
     Returns:
         The same payload unchanged if it is clean (so callers can inline the call).
     """
     for key, value in payload.items():
-        # Top-level keys are identifiers -> strict default bound.
         _scan_string(str(key), "<key>")
         _sanitize_value(str(key), value, max_len)
 
     return payload
-
-
 
 
 __all__ = [
@@ -242,4 +210,3 @@ __all__ = [
     "MAX_NL_STRING_LEN",
     "sanitize_write_payload",
 ]
-

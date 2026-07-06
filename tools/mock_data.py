@@ -1,20 +1,14 @@
 """
-tools/mock_data.py
-==================
-Deterministic mock enterprise datasets for the MCP Observation Tools (Section 4.1).
+Deterministic mock enterprise datasets for the MCP Observation Tools.
 
-Seeded around the target incident (handoff §6 Day 3):
-    "Critical shipment delay on SKU-99 for Supplier A causing a downstream shutdown at
-     Plant 2."
-
-Day-3 expansion adds the data needed for the Incident Commander to genuinely reason over
-the three mitigation strategies:
-    - ALT_SUPPLIER      -> alternate approved vendor SUP-B can supply SKU-99.
-    - INTERNAL_TRANSFER -> sister site PLANT-1 holds surplus stock transferable to PLANT-2.
+Seeded around the target incident: a critical shipment delay on SKU-99 from Supplier A
+causing a downstream shutdown risk at Plant 2. Provides the data the Incident Commander
+reasons over for the three mitigation strategies:
+    - ALT_SUPPLIER      -> approved alternate vendors (SUP-B, SUP-C) can supply SKU-99.
+    - INTERNAL_TRANSFER -> PLANT-1 holds surplus stock transferable to PLANT-2.
     - AIR_FREIGHT       -> expedite the existing delayed PO by air.
 
-These are plain Python dicts (not live systems); the MCP tools read from them and pass only
-strict primitives to the State Mutation Layer.
+These are plain Python dicts; the MCP tools read from them and return strict primitives.
 """
 
 from __future__ import annotations
@@ -23,7 +17,6 @@ from typing import Any, Dict
 
 # ---------------------------------------------------------------------------- #
 # ERP: purchase orders, vendor master, base lead-time frameworks.
-# Keyed by SKU for primary lookups; alternate suppliers listed for the ALT_SUPPLIER path.
 # ---------------------------------------------------------------------------- #
 ERP_DB: Dict[str, Dict[str, Any]] = {
     "SKU-99": {
@@ -34,18 +27,16 @@ ERP_DB: Dict[str, Dict[str, Any]] = {
         "base_lead_time_days": 14,
         "unit_cost_usd": 42.50,
         "vendor_master": {"name": "Supplier A", "rating": "APPROVED", "region": "APAC"},
-        # Alternate approved vendors that can fulfil SKU-99 (enables ALT_SUPPLIER strategy).
-        # TWO vendors so the Incident Commander can negotiate with both CONCURRENTLY
-        # (asyncio.gather) and select the best quote. Distinct cost bases => distinct
-        # negotiation floors => a meaningful lowest-price winner (no arbitrary tie).
+        # Two approved alternates with distinct cost bases, so a concurrent negotiation
+        # yields distinct floors and a meaningful lowest-price winner.
         "alternate_suppliers": [
             {
                 "supplier_id": "SUP-B",
                 "name": "Supplier B",
                 "rating": "APPROVED",
                 "region": "EU",
-                "unit_cost_usd": 46.75,       # pricier; implies a higher walk-away floor.
-                "quoted_lead_time_days": 8,   # faster than SUP-A's 14-day base, but slower than SUP-C.
+                "unit_cost_usd": 46.75,       # pricier -> higher walk-away floor.
+                "quoted_lead_time_days": 8,
                 "min_order_qty": 250,
             },
             {
@@ -53,8 +44,8 @@ ERP_DB: Dict[str, Dict[str, Any]] = {
                 "name": "Supplier C",
                 "rating": "APPROVED",
                 "region": "NA",
-                "unit_cost_usd": 44.00,       # cheaper AND faster -> the loss-minimizing winner.
-                "quoted_lead_time_days": 6,   # fastest alternate; cheapest unit price is ALSO the quickest.
+                "unit_cost_usd": 44.00,       # cheapest AND fastest -> loss-minimizing winner.
+                "quoted_lead_time_days": 6,
                 "min_order_qty": 300,
             },
 
@@ -72,15 +63,14 @@ INVENTORY_DB: Dict[str, Dict[str, Any]] = {
         "daily_consumption_units": {"PLANT-1": 150, "PLANT-2": 160},
         "safety_stock_threshold": {"PLANT-1": 600, "PLANT-2": 500},
         "inventory_days_remaining": 2,  # Plant 2 is critically short (~2 days).
-        # Sister-site transfer feasibility (enables INTERNAL_TRANSFER strategy):
-        # PLANT-1 holds surplus above its own safety stock that can be moved to PLANT-2.
+        # PLANT-1 surplus above its own safety stock, transferable to PLANT-2.
         "transfer_options": [
             {
                 "from_plant": "PLANT-1",
                 "to_plant": "PLANT-2",
-                "transferable_units": 350,   # surplus PLANT-1 can spare above its own safety stock.
-                "transit_days": 1,           # domestic sister-site lane; very fast.
-                "transfer_cost_usd": 850.0,  # internal logistics cost.
+                "transferable_units": 350,
+                "transit_days": 1,
+                "transfer_cost_usd": 850.0,
             }
         ],
 
@@ -101,7 +91,7 @@ SHIPMENT_DB: Dict[str, Dict[str, Any]] = {
         "delay_days": 9,
         "status": "DELAYED",
         "last_known_coordinates": {"lat": 1.29, "lon": 103.85},
-        # Expedite-by-air feasibility (enables AIR_FREIGHT strategy on the existing PO).
+        # Expedite-by-air feasibility for the existing PO (AIR_FREIGHT strategy).
         "air_freight_option": {
             "available": True,
             "expedited_transit_days": 2,

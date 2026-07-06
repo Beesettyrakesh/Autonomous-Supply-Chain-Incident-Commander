@@ -1,21 +1,16 @@
 """
-llm_utils.py
-============
-Shared resilience utilities for every Google Gen AI call in the system.
+Shared resilience utilities for Google Gen AI calls.
 
-Both the primary Incident Commander (`orchestrator.py`) AND the Supplier-Persona sub-graph
+Both the Incident Commander (`orchestrator.py`) and the Supplier-Persona sub-graph
 (`negotiation_agent.py`) route their `generate_content` calls through `generate_with_retry`
-so they obey ONE transient-error policy:
+so they obey one transient-error policy:
 
-- Bounded retry/backoff on 429 (rate/quota) and 5xx (transient server) errors.
+- Bounded retry/backoff on 429 (rate/quota) and 5xx (transient server) errors, plus httpx
+  transport errors (dropped connection / timeout).
 - Honors the server's suggested `RetryInfo.retryDelay` when present (capped).
-- Per-DAY quota exhaustion is NOT retried (waiting seconds can't refill a daily bucket) —
-  it raises `LLMUnavailableError` immediately so callers can escalate cleanly.
-- Uses `asyncio.sleep` (cooperative) so concurrent negotiations don't block the event loop.
-
-This is critical for the CONCURRENT multi-vendor negotiation: firing N simultaneous vendor
-calls at one endpoint via `asyncio.gather` would otherwise trigger un-throttled 429s and
-crash the sub-graph.
+- Per-DAY quota exhaustion is not retried — it raises `LLMUnavailableError` so callers
+  escalate cleanly.
+- Uses `asyncio.sleep` so concurrent negotiations don't block the event loop.
 """
 
 from __future__ import annotations
@@ -23,7 +18,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Optional
 
-# Shared transient-error retry policy (single source of truth for both agents).
 LLM_MAX_RETRIES = 3
 LLM_RETRY_CAP_SECONDS = 40.0  # never sleep longer than this on a single backoff
 
@@ -50,12 +44,11 @@ def _suggested_retry_delay(exc: Any, attempt: int) -> float:
 
 
 def _is_daily_quota_error(exc: Any) -> bool:
-    """True if a 429 is a per-DAY free-tier exhaustion (unrecoverable by waiting).
+    """True if a 429 is a per-DAY quota exhaustion (unrecoverable by waiting).
 
-    Per-day quotas carry a quotaId like 'GenerateRequestsPerDayPerProjectPerModel'.
-    Per-minute quotas ('...PerMinute...') CAN recover with a short backoff, so we only
-    skip retries for the daily kind. Best-effort against QuotaFailure details, with a
-    substring fallback on the raw message.
+    Per-day quotas carry a quotaId like 'GenerateRequestsPerDayPerProjectPerModel'; per-minute
+    quotas can recover with a short backoff, so only the daily kind skips retries. Best-effort
+    against QuotaFailure details, with a substring fallback on the raw message.
     """
     try:
         details = exc.details.get("error", {}).get("details", [])  # type: ignore[attr-defined]
@@ -83,25 +76,24 @@ async def generate_with_retry(
     Args:
         client: An initialized google-genai Client (must expose `.aio.models`).
         model: Model id (e.g. "gemini-2.5-flash").
-        contents: Prompt contents passed straight to the SDK.
+        contents: Prompt contents passed to the SDK.
         config: A `types.GenerateContentConfig` instance.
         source: Label used in log lines (e.g. "orchestrator" / "negotiation:SUP-C").
-        log: Optional callable `log(source: str, message: str)` for audit logging
-            (e.g. `LedgerStore.append_raw_log`). If None, retries happen silently.
+        log: Optional callable `log(source, message)` for audit logging. If None, retries
+            happen silently.
 
     Returns:
         The SDK response object.
 
     Raises:
-        LLMUnavailableError: on daily-quota exhaustion, non-retryable client errors, or
-            after exhausting `LLM_MAX_RETRIES` on transient 429/5xx errors.
+        LLMUnavailableError: on daily-quota exhaustion, non-retryable client errors, or after
+            exhausting `LLM_MAX_RETRIES` on transient 429/5xx/transport errors.
     """
     from google.genai import errors as genai_errors  # type: ignore
 
-    # httpx is a transitive dependency of google-genai (its HTTP transport), so it is always
-    # importable here. We catch its transport-level errors (dropped connection / timeout) as
-    # TRANSIENT and retry — a `ReadError`/`ConnectError` is exactly the kind of network blip
-    # that usually succeeds on a retry, and must NEVER crash the ReAct loop.
+    # httpx is google-genai's HTTP transport, so it is importable here. Its transport-level
+    # errors (dropped connection / timeout) are transient and usually succeed on retry, so we
+    # treat them like a 5xx rather than let them crash the ReAct loop.
     transport_errors: tuple[type[BaseException], ...]
     try:
         import httpx  # type: ignore
@@ -110,9 +102,7 @@ async def generate_with_retry(
     except Exception:  # pragma: no cover - httpx should always be present
         transport_errors = ()
 
-
     def _log(msg: str) -> None:
-
         if log is not None:
             try:
                 log(source, msg)
@@ -128,10 +118,10 @@ async def generate_with_retry(
         except genai_errors.ClientError as exc:
             last_exc = exc
             status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-            # Only 429 (rate/quota) is worth retrying among client errors.
+            # Only 429 is worth retrying among client errors.
             if status != 429:
                 raise LLMUnavailableError(f"LLM client error {status}: {exc}") from exc
-            # Daily-quota 429s cannot recover by waiting seconds — escalate immediately.
+            # Daily-quota 429s cannot recover by waiting — escalate immediately.
             if _is_daily_quota_error(exc):
                 _log("LLM 429 DAILY-quota exhausted; not retrying")
                 raise LLMUnavailableError(
@@ -148,11 +138,6 @@ async def generate_with_retry(
             if attempt < LLM_MAX_RETRIES:
                 await asyncio.sleep(delay)
         except transport_errors as exc:  # dropped connection / read-write / timeout
-            # Transport-level failure (e.g. httpx.ReadError / ConnectError / ReadTimeout):
-            # the HTTP connection to Gemini dropped mid-request. This is transient and
-            # typically succeeds on retry — treat it like a 5xx (backoff + retry) instead of
-            # letting it escape and crash the ReAct loop. After the last attempt it falls
-            # through to the LLMUnavailableError below -> clean HUMAN TAKEOVER by the caller.
             last_exc = exc
             delay = min(2.0 ** attempt, LLM_RETRY_CAP_SECONDS)
             _log(
@@ -163,7 +148,6 @@ async def generate_with_retry(
                 await asyncio.sleep(delay)
 
     raise LLMUnavailableError(
-
         f"LLM unavailable after {LLM_MAX_RETRIES} attempts: {last_exc}"
     )
 
