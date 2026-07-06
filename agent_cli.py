@@ -1,5 +1,7 @@
 """
-Terminal operator console for the Autonomous Supply Chain Incident Commander.
+Terminal operator console for OSCAR — the Operational Supply Chain Autonomous Responder.
+
+
 
 Drives the same `IncidentCommander` async ReAct loop as the dashboard, narrating each step
 (Reasoning / Action / Finding / Negotiation / Human Review / Resolution) as a colorized feed
@@ -157,10 +159,12 @@ def _parse_args(argv: Any = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="agent_cli.py",
         description=(
-            "Terminal console for the Autonomous Supply Chain Incident Commander — drives "
+            "OSCAR — Operational Supply Chain Autonomous Responder (terminal console). Drives "
             "the same autonomous ReAct loop as the dashboard, with colorized step narration "
             "and a human-in-the-loop spend-authority gate."
         ),
+
+
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -290,7 +294,9 @@ async def _run(args: argparse.Namespace) -> int:
 
     # ------------------------------ Banner ---------------------------------- #
     print(f"{C.CYAN}{S.BRIGHT}{'=' * 68}{S.RESET_ALL}")
-    print(f"{C.CYAN}{S.BRIGHT}  AUTONOMOUS SUPPLY CHAIN INCIDENT COMMANDER — CLI{S.RESET_ALL}")
+    print(f"{C.CYAN}{S.BRIGHT}  OSCAR — OPERATIONAL SUPPLY CHAIN AUTONOMOUS RESPONDER{S.RESET_ALL}")
+
+
     print(f"{C.CYAN}{'=' * 68}{S.RESET_ALL}")
     print(f"  Incident  : SKU-99 shipment delayed {args.delay} days (SUP-A -> PLANT-2)")
     print(f"  Order qty : {args.qty}  |  Spend authority: ${spend_limit:,.0f}")

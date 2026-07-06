@@ -572,10 +572,12 @@ def _render_resolution(sess: AgentSession, outcome: Optional[str]) -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="Incident Command Center",
+        page_title="OSCAR — Operational Supply Chain Autonomous Responder",
+
         layout="wide",
         initial_sidebar_state="expanded",  # sidebar stays fixed open (collapse control hidden)
     )
+
 
     st.markdown(_HIDE_CHROME_CSS, unsafe_allow_html=True)
 
@@ -673,7 +675,9 @@ def main() -> None:
         st.rerun()
 
     # ------------------------------- Header -------------------------------------------- #
-    st.title("Autonomous Supply Chain Incident Commander")
+    st.title("OSCAR — Operational Supply Chain Autonomous Responder")
+
+
     st.caption(
         "An autonomous, incident-triggered agent that reasons over a structured state "
         "ledger to resolve a critical procurement disruption — with a hard financial "

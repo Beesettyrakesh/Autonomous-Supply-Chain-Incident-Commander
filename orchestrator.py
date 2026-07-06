@@ -35,8 +35,14 @@ except ImportError:  # pragma: no cover - dotenv is optional; env vars still wor
 from pydantic import ValidationError
 
 from ledger_store import STORE, LedgerStore
-import mcp_server
+# MCP Observation Tools are split across three category servers (ERP / Inventory-WMS /
+# Logistics-TMS); the commander wires its tool registry from each server directly.
+import mcp_servers.erp_server as erp
+import mcp_servers.inventory_server as inventory
+import mcp_servers.logistics_server as logistics
 import decision_helpers
+
+
 from negotiation_agent import run_supplier_negotiation, TermsDict
 from guardrails import (
     check_spend_authority,
@@ -112,16 +118,20 @@ async def _default_human_decision(result: SpendAuthorityResult) -> bool:
 ToolFn = Callable[..., Any]
 
 TOOL_REGISTRY: Dict[str, ToolFn] = {
-    # MCP Observation Tools (I/O bound).
-    "query_erp": mcp_server.query_erp,
-    "query_inventory": mcp_server.query_inventory,
-    "query_shipment_tracking": mcp_server.query_shipment_tracking,
-    "extract_contract_rules": mcp_server.extract_contract_rules,
+    # ERP server (purchasing / sourcing).
+    "query_erp": erp.query_erp,
+    "extract_contract_rules": erp.extract_contract_rules,
+    # Inventory / WMS server.
+    "query_inventory": inventory.query_inventory,
+    # Logistics / TMS server.
+    "query_shipment_tracking": logistics.query_shipment_tracking,
     # Decision Helpers (deterministic math).
     "simulate_finance": decision_helpers.simulate_finance,
     "score_strategy": decision_helpers.score_strategy,
     "policy_check": decision_helpers.policy_check,
 }
+
+
 
 # Allowed mitigation strategies — must match the Literal set in schema.MitigationState.
 # Published to the LLM so it never invents an out-of-schema value (e.g. "EXPEDITE").
@@ -740,13 +750,14 @@ class IncidentCommander:
         # orchestrator stays decoupled from the ERP data source.
         alts = cast(
             List[Dict[str, Any]],
-            mcp_server.query_alternate_suppliers(snapshot.context.target_sku),
+            erp.query_alternate_suppliers(snapshot.context.target_sku),
         )
         incident_id = str(snapshot.metadata.id)
 
         # Buyer's willingness-to-pay ceiling is our own economics: the primary supplier's unit
-        # cost plus an acceptable premium (sourced from ERP via MCP), not the vendor's price.
-        primary = cast(Dict[str, Any], mcp_server.query_erp(snapshot.context.target_sku))
+        # cost plus an acceptable premium (sourced from the ERP server), not the vendor's price.
+        primary = cast(Dict[str, Any], erp.query_erp(snapshot.context.target_sku))
+
         primary_unit_cost = float(primary.get("unit_cost_usd", 42.5)) if primary.get("found") else 42.5
         ACCEPTABLE_PREMIUM = 1.10  # willing to pay up to 10% over primary cost to resolve.
         buyer_ceiling = round(primary_unit_cost * ACCEPTABLE_PREMIUM, 2)
