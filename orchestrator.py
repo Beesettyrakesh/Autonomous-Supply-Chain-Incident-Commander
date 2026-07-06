@@ -1,28 +1,18 @@
 """
-orchestrator.py
-===============
-The central *Incident Commander* agent (Section 2) — the LLM reasoning core.
+The central Incident Commander agent — the LLM reasoning core.
 
-This module implements the closed ReAct (Reason + Act) loop that drives the entire
-system. Each cycle the Orchestrator:
+Implements the closed ReAct (Reason + Act) loop that drives the system. Each cycle:
+    1. Read the serialized JSON of the State Ledger from `ledger_store.STORE`.
+    2. Reason: the LLM emits a `Thought:` line identifying data gaps / options.
+    3. Act: the LLM emits a tool call matching a registered MCP Observation Tool or
+       Decision Helper.
+    4. The tool is dispatched deterministically; its parsed primitives are committed back
+       to the ledger via the State Mutation Layer (`STORE.mutate`).
+    5. `loop_count` is incremented; the circuit breaker forces a stop past MAX_LOOPS.
 
-    1. READS the serialized JSON of the Structured State Ledger from `ledger_store.STORE`.
-    2. REASONS: the LLM emits an explicit `Thought:` line identifying data gaps / options.
-    3. ACTS: the LLM selects its Next Best Action by emitting a tool call that must match
-       one of our registered MCP Observation Tools or Decision Helpers.
-    4. The tool is dispatched deterministically in Python; its parsed primitives are
-       committed back to the ledger via the State Mutation Layer (`STORE.mutate`).
-    5. `loop_count` is incremented; the circuit breaker forces a stop past 10 loops.
-
-Reasoning core:
-- Uses the unified Google Gen AI SDK: `from google import genai`.
-- The API key is read securely from the environment (`GEMINI_API_KEY`) — never hardcoded.
-- The model is swappable via `GEMINI_MODEL` (defaults to `gemini-2.5-pro`).
-
-Resilience:
-- If the SDK or API key is unavailable, the module still imports cleanly and falls back
-  to a deterministic offline planner so the loop remains testable end-to-end without a
-  live model. Set `GEMINI_API_KEY` to engage the real LLM reasoning core.
+The API key is read from the environment (`GEMINI_API_KEY`) and the model from `GEMINI_MODEL`.
+If the SDK or key is unavailable, the module still imports cleanly and falls back to a
+deterministic offline planner so the loop stays testable end-to-end without a live model.
 """
 
 from __future__ import annotations
@@ -37,7 +27,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Union, cast
 
 try:
     from dotenv import load_dotenv
-    
+
     load_dotenv()
 except ImportError:  # pragma: no cover - dotenv is optional; env vars still work directly
     pass
@@ -58,44 +48,39 @@ from guardrails import (
 from llm_utils import generate_with_retry, LLMUnavailableError
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-# Hard circuit-breaker bound mirrored from the schema (loop_count le=11, escalate past 10).
+# Circuit-breaker bound mirrored from the schema (loop_count le=11, escalate past 10).
 MAX_LOOPS = 10
 
 
-# Order quantity for the mitigation purchase — the realistic per-incident variable that
-# drives total spend (unit price * qty) against the FIXED spend-authority limit. Configurable
-# via env so a demo can flip between the auto-approve path (low qty) and the HITL path (high
-# qty) without code edits. Default 500 => 500 * ~$44 = ~$22k, which exceeds the $20k limit.
+# Order quantity for the mitigation purchase — the per-incident variable that drives total
+# spend (unit price * qty) against the fixed spend-authority limit. Env-configurable so a demo
+# can flip between the auto-approve path (low qty) and the HITL path (high qty).
 ORDER_QUANTITY = int(os.environ.get("ORDER_QUANTITY", "500"))
 
-# HITL decision channel: 'cli' prompts the operator y/n at the terminal; 'auto_approve' /
-# 'auto_reject' are non-interactive defaults for tests/CI. The Streamlit dashboard injects
-# its own callable (Approve/Reject buttons) directly, bypassing this env switch.
+# HITL decision channel: 'cli' prompts the operator at the terminal; 'auto_approve' /
+# 'auto_reject' are non-interactive defaults for tests/CI. The dashboard injects its own
+# callable directly, bypassing this switch.
 HITL_MODE = os.environ.get("HITL_MODE", "cli")
 
-# A human-in-the-loop decision provider: given the breach details, return True to APPROVE
-
-# the over-limit spend or False to REJECT it. It may be SYNC (returns bool) OR ASYNC
-# (returns an awaitable bool) — `_enforce_spend_guardrail` awaits either transparently, so
-# the Streamlit dashboard can inject a plain sync callback while the CLI stays non-blocking.
+# Human-in-the-loop decision provider: given the breach details, return True to APPROVE the
+# over-limit spend or False to REJECT. May be sync or async — `_enforce_spend_guardrail`
+# awaits either transparently, so the dashboard can inject a sync callback and the CLI stays
+# non-blocking.
 HumanDecisionFn = Callable[[SpendAuthorityResult], Union[bool, Awaitable[bool]]]
 
-# An OBSERVATIONAL event sink (same pattern as LedgerStore.on_mutation): the orchestrator
-# narrates each ReAct step — thought / action / observation / negotiation / guardrail / HITL
-# / resolution — as a (kind, human_readable_message, data) tuple. This is PURELY for the
-# presentation layer (the Streamlit "Incident Command Center"); it NEVER affects control
-# flow, and any exception in the sink is swallowed so telemetry can't break the agent.
+# Observational event sink (same pattern as LedgerStore.on_mutation): the orchestrator narrates
+# each ReAct step as a (kind, message, data) tuple for the presentation layer. It never affects
+# control flow, and any exception in the sink is swallowed so telemetry can't break the agent.
 EventFn = Callable[[str, str, Dict[str, Any]], None]
-
 
 
 async def _default_human_decision(result: SpendAuthorityResult) -> bool:
     """Default HITL provider driven by HITL_MODE (cli | auto_approve | auto_reject).
 
-    Returns True to APPROVE the over-limit purchase, False to REJECT it. The auto_* modes
-    make deterministic choices for offline tests/CI. The CLI mode reads operator input via
+    Returns True to APPROVE the over-limit purchase, False to REJECT. The auto_* modes make
+    deterministic choices for offline tests/CI. The CLI mode reads operator input via
     `asyncio.to_thread(input, ...)` so the blocking terminal prompt runs on a worker thread
-    and NEVER stalls the asyncio event loop (keeps concurrent tasks / UI telemetry alive).
+    and never stalls the event loop.
     """
     if HITL_MODE == "auto_approve":
         return True
@@ -113,17 +98,15 @@ async def _default_human_decision(result: SpendAuthorityResult) -> bool:
         "Approve this purchase? [y/N]: "
     )
     try:
-        # Offload blocking input() to a worker thread — does NOT block the event loop.
+        # Offload blocking input() to a worker thread so it doesn't block the event loop.
         answer = (await asyncio.to_thread(input, prompt)).strip().lower()
     except EOFError:  # non-interactive stdin -> safe default is to REJECT
         return False
     return answer in ("y", "yes")
 
 
-
 # ---------------------------------------------------------------------------- #
-# Tool registry — the ONLY actions the Orchestrator may select each turn.
-
+# Tool registry — the only actions the orchestrator may select each turn.
 # Maps the tool name the LLM emits to a concrete Python callable.
 # ---------------------------------------------------------------------------- #
 ToolFn = Callable[..., Any]
@@ -140,19 +123,17 @@ TOOL_REGISTRY: Dict[str, ToolFn] = {
     "policy_check": decision_helpers.policy_check,
 }
 
-# Allowed mitigation strategies — MUST match the Literal set in schema.MitigationState.
+# Allowed mitigation strategies — must match the Literal set in schema.MitigationState.
 # Published to the LLM so it never invents an out-of-schema value (e.g. "EXPEDITE").
 VALID_STRATEGIES = ("ALT_SUPPLIER", "INTERNAL_TRANSFER", "AIR_FREIGHT")
 
-# Virtual (non-registry) actions the orchestrator handles itself, in addition to the
-# concrete TOOL_REGISTRY functions. `commit_strategy` is a selection decision (not a
-# computational helper); `DONE` is the terminal signal.
+# Virtual (non-registry) actions the orchestrator handles itself. `commit_strategy` is a
+# selection decision; `DONE` is the terminal signal.
 CONTROL_ACTIONS = ("commit_strategy", "DONE")
 KNOWN_TOOLS = frozenset(TOOL_REGISTRY) | frozenset(CONTROL_ACTIONS)
 
 
-# Human-readable tool contracts injected into the system prompt so the LLM emits valid
-# tool-calling syntax. Kept terse and machine-oriented (no markdown prose in state).
+# Tool contracts injected into the system prompt so the LLM emits valid tool-calling syntax.
 TOOL_CATALOG = f"""
 AVAILABLE TOOLS (select exactly one per turn):
 - query_erp(sku_id: str)                    -> PO records, vendor master, base lead-time
@@ -229,12 +210,12 @@ Respond with ONLY the 'Thought:' line and the 'Action:' line. No extra commentar
 
 
 # ---------------------------------------------------------------------------- #
-# Gemini client bootstrap (secure, resilient).
+# Gemini client bootstrap.
 # ---------------------------------------------------------------------------- #
 def _init_genai_client() -> Optional[Any]:
-    """
-    Build the unified Google Gen AI client from GEMINI_API_KEY. Returns None if the SDK is
-    not installed or no key is present, allowing a deterministic offline fallback.
+    """Build the Google Gen AI client from GEMINI_API_KEY.
+
+    Returns None if the SDK is not installed or no key is present, enabling the offline fallback.
     """
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -247,9 +228,7 @@ def _init_genai_client() -> Optional[Any]:
 
 
 class IncidentCommander:
-    """
-    Central orchestrator. Wired directly to the `STORE` singleton for reads/mutations.
-    """
+    """Central orchestrator, wired to the `STORE` singleton for reads/mutations."""
 
     def __init__(
         self,
@@ -264,25 +243,22 @@ class IncidentCommander:
         self._client = _init_genai_client()
         # True when a live LLM core is available; else we use the offline planner.
         self.llm_enabled = self._client is not None
-        # Order quantity is the realistic per-incident variable driving total spend against
-        # the FIXED delegated authority limit — flip it to demo auto-approve vs HITL paths.
+        # Order quantity drives total spend against the fixed authority limit — flip it to
+        # demo the auto-approve vs HITL paths.
         self.order_quantity = order_quantity
         self.spend_authority_limit_usd = spend_authority_limit_usd
-        # HITL decision provider (approve/reject an over-limit spend). Defaults to the
-
-        # env-driven CLI/auto provider; the Streamlit dashboard injects its own callable.
+        # HITL decision provider; defaults to the env-driven CLI/auto provider (the dashboard
+        # injects its own callable).
         self.human_decision: HumanDecisionFn = human_decision or _default_human_decision
-        # OBSERVATIONAL narration sink (optional). The Streamlit dashboard registers one to
-        # render the live "Incident Command Center" step feed. Behaviour-neutral.
+        # Observational narration sink (optional); behaviour-neutral.
         self.on_event: Optional[EventFn] = on_event
 
     def _emit(self, kind: str, message: str, **data: Any) -> None:
-        """Fire the observational event sink (if any). NEVER affects control flow.
+        """Fire the observational event sink (if any). Never affects control flow.
 
         `kind` is a machine tag the UI maps to an icon (thought | action | observation |
-        negotiation | guardrail | hitl | resolution | error); `message` is a data-rich,
-        human-readable line; `data` carries structured extras the UI may use. Any exception
-        in the sink is swallowed — telemetry must never break the agent.
+        negotiation | guardrail | hitl | resolution | error); `message` is a human-readable
+        line; `data` carries structured extras. Any exception in the sink is swallowed.
         """
         if self.on_event is None:
             return
@@ -293,11 +269,7 @@ class IncidentCommander:
 
     @staticmethod
     def _humanize_observation(tool: str, result: Any) -> str:
-        """Translate a tool's raw result into a data-rich, plain-English line for the UI.
-
-        The concrete values (PO id, delay days, dollar amounts, scores) are embedded in the
-        sentence — so a user/judge sees full detail without reading raw JSON.
-        """
+        """Translate a tool's raw result into a data-rich, plain-English line for the UI."""
         if not isinstance(result, dict):
             return str(result)
         r = cast(Dict[str, Any], result)
@@ -334,12 +306,11 @@ class IncidentCommander:
         return json.dumps(r)
 
     def _summarize_resolution(self, ledger: Any) -> str:
-        """Build a plain-English, snapshot-derived RESOLUTION summary for the UI's Zone 3.
+        """Build a plain-English RESOLUTION summary for the UI, derived from the final ledger.
 
-        Read straight off the final `StateLedger` (the single source of truth) so the summary
-        is always correct even if a streamed event was missed — it states HOW the incident was
-        resolved (or WHY it was escalated), the strategy chosen, the vendor/terms/spend when a
-        purchase was made, and the projected loss that was averted (or remains unmitigated).
+        States HOW the incident was resolved (or WHY escalated), the strategy chosen, the
+        vendor/terms/spend when a purchase was made, and the projected loss averted (or that
+        remains unmitigated). Exactly one leading status glyph (✅ / 🚨) is kept.
         """
         mit = ledger.mitigation
         metrics = ledger.metrics
@@ -391,17 +362,10 @@ class IncidentCommander:
             f"✅ Incident resolved (strategy: {strat}). "
             f"Projected loss of ${loss:,.0f} addressed."
         )
-        # NOTE: exactly ONE leading status emoji is kept per resolution string (✅ resolved /
-        # 🚨 escalated) — the two "moments that matter". All other agent narration is plain
-        # text so the cockpit stays professional and typographically consistent.
-
-
-
 
     # ------------------------------------------------------------------ #
     # Reasoning: produce a (thought, action) decision for the current ledger.
     # ------------------------------------------------------------------ #
-
     async def _reason(self, ledger_json: str, scratchpad: str) -> Dict[str, Any]:
         """Ask the reasoning core for the next Thought + Action given ledger + history."""
         if self.llm_enabled and self._client is not None:
@@ -412,8 +376,8 @@ class IncidentCommander:
         """Invoke Gemini (async) and parse the 'Thought:' / 'Action:' response.
 
         The `scratchpad` carries the running ReAct history (prior Thought / Action /
-        Observation turns) so the model has memory of what it already did and observed —
-        this is the Observation step that prevents blind, repeated tool calls.
+        Observation turns) so the model remembers what it already did — the Observation step
+        that prevents blind, repeated tool calls.
         """
         from google.genai import types  # type: ignore
 
@@ -436,11 +400,7 @@ class IncidentCommander:
         return self._parse_react_text(response.text or "")
 
     async def _generate_with_retry(self, contents: str, config: Any) -> Any:
-        """Call Gemini via the SHARED resilient helper (`llm_utils.generate_with_retry`).
-
-        The retry/backoff policy for 429/5xx (and daily-quota escalation) lives in one place
-        so the Incident Commander and the Supplier-Persona sub-graph behave identically.
-        """
+        """Call Gemini via the shared resilient helper so both agents share one retry policy."""
         return await generate_with_retry(
             self._client,
             model=GEMINI_MODEL,
@@ -451,13 +411,11 @@ class IncidentCommander:
         )
 
     def _reason_offline(self, ledger_json: str) -> Dict[str, Any]:
+        """Deterministic fallback planner used when no live model is configured.
 
-        """
-        Deterministic fallback planner used when no live model is configured.
-
-        It walks the same information-gathering order a well-behaved LLM would follow,
-        driven purely by which ledger fields are still unpopulated. This keeps the closed
-        loop fully exercisable in CI / smoke tests without an API key.
+        Walks the same information-gathering order a well-behaved LLM would follow, driven by
+        which ledger fields are still unpopulated, so the closed loop is fully exercisable in
+        CI / smoke tests without an API key.
         """
         ledger: Dict[str, Any] = json.loads(ledger_json)
         ctx: Dict[str, Any] = ledger["context"]
@@ -474,11 +432,9 @@ class IncidentCommander:
                     "args": {"contract_id": ctx["active_contract_id"]},
                 },
             }
-        # 2) Quantify financial exposure now that the rate is known. Pass NO explicit
-        # delay_days so simulate_finance reads the OBSERVED slip from the ledger
-        # (metrics.delay_days, seeded at init / written by query_shipment_tracking) — this is
-        # what makes the projected loss DYNAMIC: change the incident's delay and the exposure
-        # recomputes, instead of being pinned to a hardcoded literal.
+        # 2) Quantify financial exposure. Pass no explicit delay_days so simulate_finance reads
+        # the observed slip from the ledger (metrics.delay_days) — this makes the projected
+        # loss dynamic: change the delay and the exposure recomputes.
         if metrics.get("projected_total_loss_usd", 0.0) == 0.0:
             return {
                 "thought": "Penalty rate known; simulate the financial impact of the observed delay.",
@@ -492,19 +448,10 @@ class IncidentCommander:
                     "thought": f"Evaluate {candidate} so I can compare options before committing.",
                     "action": {"tool": "score_strategy", "args": {"strategy_type": candidate}},
                 }
-        # 4) All scored: deliberately COMMIT the best *feasible* strategy.
-        # Committing is the resolving action (the run loop treats it as terminal), so this
-        # is the planner's final decision for this incident type — no separate DONE turn is
-        # emitted here (that would be unreachable and waste a loop against the breaker bound).
-        #
-        # FEASIBILITY GATE (separate from the desirability scores): a strategy can only be
-        # committed if it is actually POSSIBLE this incident (e.g. INTERNAL_TRANSFER needs
-        # enough PLANT-1 surplus to cover the order; AIR_FREIGHT needs the lane available).
-        # We compare only the feasible options, so an infeasible-but-high-scoring option
-        # (e.g. INTERNAL_TRANSFER when stock is depleted) is excluded and the agent ORGANICALLY
-        # escalates to ALT_SUPPLIER — which triggers negotiation + the spend-authority
-        # guardrail + HITL. Scores stay honest and unmodified; we just don't pick the
-        # impossible one. `pool` never goes empty (ALT_SUPPLIER is always feasible).
+        # 4) All scored: commit the best FEASIBLE strategy (committing is terminal, so no
+        # separate DONE turn). The feasibility gate is separate from the scores: an
+        # infeasible-but-high-scoring option is excluded so the agent organically escalates
+        # to ALT_SUPPLIER. `pool` never goes empty (ALT_SUPPLIER is always feasible).
         feasible = {s: v for s, v in scores.items() if self._is_strategy_feasible(s, metrics)}
         pool = feasible or scores
         best = max(pool, key=lambda k: pool[k])
@@ -517,13 +464,11 @@ class IncidentCommander:
     def _narrate_commit_reasoning(
         self, best: str, feasible: Dict[str, Any], metrics: Dict[str, Any]
     ) -> str:
-        """Compose a business-style commit rationale from the REAL feasibility numbers.
+        """Compose the offline planner's final 'Thought' from the real feasibility numbers.
 
-        This is what the OFFLINE planner surfaces as its final 'Thought' — it should read
-        like a procurement manager stating the true reason each closed option was ruled out
-        (internal surplus can't cover the shortfall / no air capacity on this lane), then why
-        it commits the chosen one. Mirrors the live SYSTEM_PROMPT wording so offline rehearsals
-        and live runs tell the SAME honest story. Purely narration — never changes the choice.
+        Reads like a procurement manager stating the true reason each closed option was ruled
+        out, then why it commits the chosen one — mirroring the live SYSTEM_PROMPT wording.
+        Purely narration; never changes the choice.
         """
         transferable = int(metrics.get("transferable_units", 0))
         required = int(metrics.get("replacement_order_qty") or self.order_quantity)
@@ -537,8 +482,7 @@ class IncidentCommander:
                 f"{required}-unit shortfall, so an internal transfer won't close the gap"
             )
         if "AIR_FREIGHT" not in feasible:
-            # Distinguish WHY air is closed: the lane is grounded vs the finite air cargo
-            # capacity simply can't fit this order (the quantity-driven escalation trigger).
+            # Distinguish WHY air is closed: lane grounded vs finite capacity can't fit the order.
             if not air_available:
                 reasons.append(
                     "the carrier has no air capacity on this lane, so air freight can't be executed"
@@ -575,54 +519,38 @@ class IncidentCommander:
             )
         return f"Committing {best} as the best feasible mitigation for this incident."
 
-
-
     def _is_strategy_feasible(self, strategy: str, metrics: Dict[str, Any]) -> bool:
-        """Deterministic FEASIBILITY gate — can this strategy even be executed this incident?
+        """Deterministic feasibility gate — can this strategy be executed this incident?
 
-        This is DISTINCT from the desirability score: scoring says how *good* an option is;
-        feasibility says whether it is *possible* at all. Gating selection on feasibility is
-        how the agent realistically escalates the procurement ladder (try internal stock →
-        expedite → alternate supplier) without ever fudging the scores.
+        Distinct from the desirability score: gating selection on feasibility is how the agent
+        escalates the procurement ladder (internal stock → expedite → alternate supplier)
+        without fudging the scores.
 
         - INTERNAL_TRANSFER: feasible only if PLANT-1's transferable surplus covers the full
-          replacement order quantity (single-strategy model — no partial split).
-        - AIR_FREIGHT: feasible only if the delayed PO can actually be expedited by air.
-        - ALT_SUPPLIER: always feasible (there is an approved alternate vendor pool).
+          replacement order quantity.
+        - AIR_FREIGHT: feasible only if the lane is open AND finite air capacity covers the qty.
+        - ALT_SUPPLIER: always feasible (approved alternate vendor pool).
 
-        The required quantity is read from `metrics.replacement_order_qty` — the SAME value
-        serialized into the ledger JSON the LLM sees — so the model, the offline planner, and
-        this backstop all compare against ONE number (no hidden-state drift). We fall back to
-        `self.order_quantity` only if the ledger field is unset (0), keeping old callers safe.
+        The required quantity is read from `metrics.replacement_order_qty` — the same value the
+        LLM sees — so the model, offline planner, and this backstop all compare one number,
+        falling back to `self.order_quantity` only if the ledger field is unset.
         """
         if strategy == "INTERNAL_TRANSFER":
             required = int(metrics.get("replacement_order_qty") or self.order_quantity)
             return int(metrics.get("transferable_units", 0)) >= required
         if strategy == "AIR_FREIGHT":
-            # Air is feasible only if the lane is open AND the FINITE air cargo capacity can
-            # cover the required quantity — aircraft hold volume is limited, so a large order
-            # can exceed it and force escalation to an alternate supplier.
             required = int(metrics.get("replacement_order_qty") or self.order_quantity)
             capacity = int(metrics.get("air_freight_capacity_units", 0))
             return bool(metrics.get("air_freight_available", True)) and capacity >= required
         return True
 
-
-
-
-
     @staticmethod
     def _extract_json_object(blob: str) -> Optional[Dict[str, Any]]:
         """Best-effort extraction of a single JSON object from messy LLM text.
 
-        Live models often wrap the Action JSON in markdown code fences (```json ... ```),
-        add stray prose, or pretty-print across multiple lines. A naive greedy `\\{.*\\}`
-        can swallow trailing junk and fail to parse. This helper:
-          1. strips ```json / ``` fences,
-          2. finds the FIRST '{' then scans with brace-depth counting to the MATCHING '}'
-             (so it isolates exactly one balanced object, ignoring anything after it),
-          3. attempts json.loads on that balanced substring.
-        Returns the parsed dict, or None if no valid object is found.
+        Strips markdown code fences, then scans from the first '{' with brace-depth counting to
+        the matching '}' so exactly one balanced object is isolated (tolerating trailing prose /
+        pretty-printing). Returns the parsed dict, or None if no valid object is found.
         """
         # 1) Strip markdown code fences (```json ... ``` or ``` ... ```).
         cleaned = re.sub(r"```(?:json)?", "", blob, flags=re.IGNORECASE).replace("```", "")
@@ -647,16 +575,14 @@ class IncidentCommander:
                     return cast(Dict[str, Any], parsed) if isinstance(parsed, dict) else None
         return None
 
-
     @classmethod
     def _parse_react_text(cls, text: str) -> Dict[str, Any]:
         """Extract the 'Thought:' string and the JSON 'Action:' object from raw output.
 
-        Thinking models (e.g. gemini-2.5-flash) often emit multi-line reasoning after the
-        'Thought:' token (captured via DOTALL) and frequently wrap the Action JSON in
-        markdown code fences. We isolate the Action payload after the 'Action:' token and
-        parse it with a brace-matching, fence-tolerant extractor so valid tool calls are
-        NOT silently downgraded to DONE (which would halt the agent prematurely).
+        Thinking models emit multi-line reasoning after 'Thought:' (captured via DOTALL) and
+        often wrap the Action JSON in code fences. We isolate the payload after 'Action:' and
+        parse it with a brace-matching, fence-tolerant extractor so valid tool calls aren't
+        silently downgraded to DONE.
         """
         # Capture multi-line thought up to the Action token (or end of text).
         thought_match = re.search(
@@ -664,8 +590,7 @@ class IncidentCommander:
         )
         thought = thought_match.group(1).strip() if thought_match else ""
 
-        # Grab everything AFTER the first 'Action:' token, then extract one JSON object
-        # from it (tolerating code fences / pretty-printing / trailing prose).
+        # Grab everything after the first 'Action:' token, then extract one JSON object.
         action: Dict[str, Any] = {"tool": "DONE", "args": {}}
         action_split = re.split(r"Action:\s*", text, maxsplit=1, flags=re.IGNORECASE)
         if len(action_split) == 2:
@@ -676,31 +601,25 @@ class IncidentCommander:
             # else: malformed/absent tool syntax -> safe deterministic DONE.
         return {"thought": thought, "action": action}
 
-
     # ------------------------------------------------------------------ #
     # Acting: dispatch the selected tool and translate output into a ledger patch.
     # ------------------------------------------------------------------ #
     def _dispatch_tool(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a registered tool, injecting the ledger snapshot where required.
 
-        Performs defensive argument validation BEFORE running the tool so a semantically
-        reasonable but schema-noncompliant LLM output (e.g. strategy_type="EXPEDITE")
-        becomes a recoverable error Observation instead of a downstream crash.
+        Validates arguments defensively BEFORE running the tool so a schema-noncompliant LLM
+        output becomes a recoverable error Observation instead of a downstream crash.
         """
-        # SECURITY (§5.1): sanitize EVERY dispatched tool's args (defense-in-depth), not
-        # just write actions. Any LLM-supplied string is scanned for prompt-injection /
-        # command-escape patterns + length bounds BEFORE the tool runs; a hit aborts with a
-        # recoverable error Observation (the loop continues safely).
+        # Security: sanitize every dispatched tool's args (defense-in-depth). A hit aborts with
+        # a recoverable error Observation and the loop continues safely.
         try:
             sanitize_write_payload(args)
         except InjectionAttemptError as exc:
             LedgerStore.append_raw_log("security", f"INJECTION_BLOCKED tool={tool} args={args} err={exc}")
             return {"result": {"error": f"tool call blocked by security layer: {exc}"}}
 
-        # Guard: reject out-of-schema strategy names up front and tell the model why.
-        # Applies to BOTH evaluation (score_strategy) and selection (commit_strategy).
+        # Reject out-of-schema strategy names up front (score_strategy and commit_strategy).
         if tool in ("score_strategy", "commit_strategy"):
-
             strat = str(args.get("strategy_type", ""))
             if strat not in VALID_STRATEGIES:
                 return {
@@ -712,18 +631,13 @@ class IncidentCommander:
                     }
                 }
 
-        # commit_strategy is a selection action (not a computational helper): it simply
-        # confirms the chosen strategy, which _mutation_for then writes to active_strategy.
-        # (Its args were ALREADY sanitized by the single entry-point sweep above — no
-        # duplicate scan needed here.)
+        # commit_strategy simply confirms the chosen strategy (args already sanitized above).
         if tool == "commit_strategy":
             strat = str(args.get("strategy_type", ""))
-            # FEASIBILITY BACKSTOP (deterministic): even though the prompt tells the LLM not
-            # to commit an infeasible strategy, we ENFORCE it in code so a live model that
-            # ignores the rule can't drive an impossible action (e.g. INTERNAL_TRANSFER when
-            # PLANT-1 has no surplus). A blocked commit becomes a recoverable error
-            # Observation, so the agent re-selects a feasible option next turn. This is what
-            # organically routes the depleted-stock scenario to ALT_SUPPLIER — live AND offline.
+            # Feasibility backstop: enforce feasibility in code so a live model that ignores the
+            # prompt rule can't drive an impossible action. A blocked commit becomes a
+            # recoverable error Observation, so the agent re-selects a feasible option — this is
+            # what organically routes a depleted-stock scenario to ALT_SUPPLIER.
             metrics = self.store.snapshot_dict().get("metrics", {})
             if not self._is_strategy_feasible(strat, metrics):
                 LedgerStore.append_raw_log(
@@ -742,17 +656,12 @@ class IncidentCommander:
                 }
             return {"result": {"committed_strategy": strat}}
 
-
-
-
         fn = TOOL_REGISTRY[tool]
         # Decision Helpers that reason over full state receive the live snapshot.
         if tool in ("simulate_finance", "score_strategy"):
             args = {**args, "state_ledger_snapshot": self.store.snapshot_dict()}
-        # RESILIENCE: a live LLM can emit missing/extra/mistyped args for any tool. Guard the
-        # call so a bad signature (e.g. omitting a required arg) becomes a recoverable error
-        # Observation instead of crashing the ReAct loop — same philosophy as the mutation
-        # ValidationError net and the strategy/injection guards above.
+        # Resilience: guard the call so a bad signature (e.g. a missing arg) becomes a
+        # recoverable error Observation instead of crashing the ReAct loop.
         try:
             result = fn(**args)
         except TypeError as exc:
@@ -760,31 +669,26 @@ class IncidentCommander:
             return {"result": {"error": f"invalid arguments for '{tool}': {exc}"}}
         return {"result": result}
 
-
     def _mutation_for(self, tool: str, output: Dict[str, Any]) -> Dict[str, Any]:
         """Map a tool's parsed output to a validated State Ledger patch (Mutation Layer)."""
         raw = output.get("result")
         if not isinstance(raw, dict):
             return {}
-        # After the isinstance guard, treat the payload as a typed str-keyed mapping.
         result = cast(Dict[str, Any], raw)
 
         if tool == "extract_contract_rules" and result.get("found"):
             return {"context": {"contracted_penalty_rate": result["contracted_penalty_rate"]}}
         if tool == "query_shipment_tracking" and result.get("found"):
-            # Record ONLY the observed delay as a dedicated `delay_days` primitive.
-            # IMPORTANT (fix): do NOT overwrite `production_shutdown_hours` here — a shipment
-            # delay is NOT the same as shutdown hours; the on-hand inventory buffer absorbs
-            # part of it. `simulate_finance` remains the SOLE authority on shutdown/downtime
-            # math (it derives shutdown days from delay beyond inventory_days_remaining).
+            # Record only the observed delay. Do NOT overwrite production_shutdown_hours — a
+            # shipment delay is not the same as shutdown hours; simulate_finance remains the sole
+            # authority on downtime math (delay beyond inventory_days_remaining).
             delay_days = int(result.get("delay_days", 0))
             if delay_days > 0:
                 return {"metrics": {"delay_days": delay_days}}
             return {}
 
         if tool == "simulate_finance":
-            # Persist the computed financial primitives to the ledger so the single source
-            # of truth captures the incident's financial exposure (not just static revenue).
+            # Persist the computed financial primitives so the ledger captures the exposure.
             return {
                 "metrics": {
                     "daily_penalty_usd": result["daily_penalty_usd"],
@@ -792,19 +696,17 @@ class IncidentCommander:
                 }
             }
         if tool == "score_strategy":
-            # EVALUATE only: record the score under strategy_scores WITHOUT selecting it.
-            # A leaf patch is sufficient — the State Mutation Layer's deep-merge preserves
-            # previously-scored sibling strategies, so we needn't rebuild the dict here.
+            # Evaluate only: record the score without selecting it. The deep-merge preserves
+            # previously-scored sibling strategies, so a leaf patch is sufficient.
             strat = str(result["strategy_type"])
             return {"mitigation": {"strategy_scores": {strat: result["composite_score"]}}}
         if tool == "commit_strategy":
-            # SELECT: a deliberate, separate decision that sets the active strategy after
-            # the agent has compared the recorded strategy_scores.
+            # Select: set the active strategy after comparing the recorded scores.
             strat = str(result.get("committed_strategy", ""))
             if strat in VALID_STRATEGIES:
                 return {"mitigation": {"active_strategy": strat}}
             return {}
-        # Observation tools that only inform reasoning need no direct mutation this turn.
+        # Observation tools that only inform reasoning need no mutation this turn.
         return {}
 
     # ------------------------------------------------------------------ #
@@ -818,38 +720,32 @@ class IncidentCommander:
             lines.append(f"Turn {i}:")
             lines.append(f"  Thought: {turn.get('thought', '')}")
             lines.append(f"  Action: {turn.get('tool')} {turn.get('args', {})}")
-            # The Observation is the actual tool output fed back to the model (the key
-            # missing piece that turns blind repetition into grounded reasoning).
+            # The Observation is the actual tool output fed back to the model — what turns
+            # blind repetition into grounded reasoning.
             lines.append(f"  Observation: {json.dumps(turn.get('output'))}")
         return "\n".join(lines)
 
     async def _maybe_negotiate(self, verbose: bool) -> None:
-        """
-        After an ALT_SUPPLIER commit, negotiate with ALL alternate suppliers CONCURRENTLY
+        """After an ALT_SUPPLIER commit, negotiate with all alternate suppliers concurrently
         (asyncio.gather) and select the lowest-price winner.
 
-        CRITICAL BUDGET RULE: the entire multi-vendor negotiation (all internal LLM-to-LLM
-        volleys across suppliers) is ONE orchestrator action. This method `await`s the
-        sub-graphs but does NOT call `increment_loop()` — the surrounding run() turn already
-        counts as the single loop. Each sub-graph keeps its own isolated turn counter.
-
-        CONCURRENCY LOCK: the orchestrator holds the master status lock. It writes
-        `negotiation_status=IN_PROGRESS` once here, runs the suppliers with
-        `write_status=False` (so they never race on the shared field), then writes the
-        single final SUCCESS/FAILED after evaluating results.
+        The entire multi-vendor negotiation is ONE orchestrator action — this method awaits the
+        sub-graphs but does NOT call increment_loop(). The orchestrator holds the master status
+        lock: it writes negotiation_status=IN_PROGRESS once, runs the suppliers with
+        write_status=False (so they never race on the shared field), then writes the single
+        final SUCCESS/FAILED after evaluating results.
         """
         snapshot = self.store.snapshot()
-        # Discover alternate vendors THROUGH the MCP layer (never a direct DB import): the
-        # orchestrator stays decoupled from the ERP data source, exactly like production.
+        # Discover alternate vendors through the MCP layer (never a direct DB import) so the
+        # orchestrator stays decoupled from the ERP data source.
         alts = cast(
             List[Dict[str, Any]],
             mcp_server.query_alternate_suppliers(snapshot.context.target_sku),
         )
         incident_id = str(snapshot.metadata.id)
 
-        # Buyer's willingness-to-pay ceiling is derived from OUR OWN economics, not the
-        # vendor's price: it's the primary supplier's unit cost plus an acceptable premium
-        # we'll tolerate to avoid the far larger downtime loss. (Sourced from ERP via MCP.)
+        # Buyer's willingness-to-pay ceiling is our own economics: the primary supplier's unit
+        # cost plus an acceptable premium (sourced from ERP via MCP), not the vendor's price.
         primary = cast(Dict[str, Any], mcp_server.query_erp(snapshot.context.target_sku))
         primary_unit_cost = float(primary.get("unit_cost_usd", 42.5)) if primary.get("found") else 42.5
         ACCEPTABLE_PREMIUM = 1.10  # willing to pay up to 10% over primary cost to resolve.
@@ -862,7 +758,7 @@ class IncidentCommander:
                 print("[SUB-GRAPH] No alternate suppliers available; negotiation FAILED.")
             return
 
-        # Orchestrator takes the master status lock BEFORE spawning concurrent negotiations.
+        # Orchestrator takes the master status lock before spawning concurrent negotiations.
         self.store.mutate({"mitigation": {"negotiation_status": "IN_PROGRESS"}})
         vendor_ids = ", ".join(str(a["supplier_id"]) for a in alts)
         self._emit(
@@ -873,13 +769,9 @@ class IncidentCommander:
         if verbose:
             print(f"[SUB-GRAPH] Negotiating {len(alts)} suppliers concurrently (asyncio.gather) ...")
 
-
-        # Build one negotiation coroutine per alternate supplier with a defensible economic
-        # model:
-        #   - buyer ceiling  = OUR willingness-to-pay (primary cost + tolerated premium),
-        #                      shared across vendors — it's about our economics, not theirs.
-        #   - supplier floor = that vendor's TRUE unit cost (a rational vendor won't sell
-        #                      below cost); distinct per vendor, so quotes genuinely differ.
+        # One negotiation coroutine per alternate supplier:
+        #   - buyer ceiling  = our willingness-to-pay (shared across vendors).
+        #   - supplier floor = that vendor's true unit cost (distinct per vendor, so quotes differ).
         async def negotiate_one(alt: Dict[str, Any]) -> TermsDict:
             vendor_floor = float(alt["unit_cost_usd"])  # vendor won't go below its own cost
             return await run_supplier_negotiation(
@@ -889,7 +781,6 @@ class IncidentCommander:
                     "required_lead_time_days": int(alt.get("quoted_lead_time_days", 6)),
                     "qty": self.order_quantity,
                 },
-
                 supplier_id=str(alt["supplier_id"]),
                 floor_price=vendor_floor,
                 lead_time_days=int(alt.get("quoted_lead_time_days", 6)),
@@ -897,10 +788,8 @@ class IncidentCommander:
                 write_status=False,  # orchestrator owns the shared status field
             )
 
-        # CONCURRENCY RESILIENCE (fix): pass return_exceptions=True so a single vendor
-        # sub-graph failure (timeout / dropped connection / LLM error) does NOT abort the
-        # whole gather and crash the orchestrator. Failures come back as Exception objects
-        # in the results list; we log and drop them, then proceed with whatever succeeded.
+        # return_exceptions=True so a single vendor failure doesn't abort the gather; failures
+        # come back as Exception objects that we log and drop, proceeding with what succeeded.
         raw_results: List[Any] = await asyncio.gather(
             *(negotiate_one(a) for a in alts), return_exceptions=True
         )
@@ -917,8 +806,7 @@ class IncidentCommander:
         # Keep only successful quotes.
         successful = [r for r in results if r.get("negotiation_outcome_status") == "SUCCESS"]
 
-
-        # EMPTY-SEQUENCE GUARD: never call min() on an empty list.
+        # Never call min() on an empty list.
         if len(successful) == 0:
             self.store.mutate({"mitigation": {"negotiation_status": "FAILED"}})
             LedgerStore.append_raw_log(
@@ -931,7 +819,6 @@ class IncidentCommander:
         # Select the lowest agreed unit price among successful vendors.
         best = min(successful, key=lambda r: float(r["agreed_unit_price_usd"]))
 
-        # Winning supplier id is logged for the audit trail AND persisted (now in-schema).
         LedgerStore.append_raw_log(
             "orchestrator",
             f"negotiation WINNER incident={incident_id} supplier={best.get('agreed_supplier_id')} "
@@ -949,14 +836,9 @@ class IncidentCommander:
                 }
             }
         )
-        # --- NEGOTIATION TRANSCRIPT (UI narration) -------------------------------------- #
-        # Reconstruct a clean, SEQUENTIAL buyer<->supplier chat from the REAL negotiation
-        # numbers (buyer opening offer + each vendor's actually-agreed price/lead + the
-        # lowest-price winner). The live sub-graph bargains CONCURRENTLY and logs raw volleys
-        # to incident_execution.log; this transcript is purely observational for the cockpit
-        # and never changes the outcome. Emitted with role tags so the dashboard can render
-        # it as chat bubbles (buyer vs supplier). Grounded in the same terms written to the
-        # ledger — the winning price/lead shown here are the real agreed primitives.
+        # Negotiation transcript (UI narration): a clean SEQUENTIAL reconstruction from the real
+        # agreed numbers. The live sub-graph bargains concurrently; this is purely observational
+        # and never changes the outcome. Emitted with role tags for chat-bubble rendering.
         best_supplier = str(best["agreed_supplier_id"])
         best_price = float(best["agreed_unit_price_usd"])
         best_lead = int(best["agreed_lead_time_days"])
@@ -1003,24 +885,19 @@ class IncidentCommander:
         if verbose:
             print(f"[SUB-GRAPH] Best quote: {best}")
 
-
-        # --- FINANCIAL SPEND-AUTHORITY GUARDRAIL (§5.2) --------------------------------- #
-
-        # A deal is on the table. Before it is treated as resolved, the deterministic
-        # guardrail checks whether the total spend (unit price * order quantity) is within
-        # the agent's delegated authority. Over-limit spend hard-forks to a HUMAN-IN-THE-LOOP
-        # approve/reject decision — the LLM has NO say in this barrier.
+        # Financial spend-authority guardrail: before the deal is treated as resolved, check
+        # whether total spend is within the delegated authority. Over-limit spend hard-forks to
+        # a human-in-the-loop approve/reject decision — the LLM has no say in this barrier.
         await self._enforce_spend_guardrail(best, verbose)
 
     async def _enforce_spend_guardrail(self, best: TermsDict, verbose: bool) -> None:
-
-        """Run the spend-authority guardrail on a won deal and drive the HITL decision (§5.2).
+        """Run the spend-authority guardrail on a won deal and drive the HITL decision.
 
         Outcomes written to the ledger:
-        - within authority        -> guardrail PASSED, deal stands (resolved by caller).
+        - within authority         -> guardrail PASSED, deal stands.
         - over authority, APPROVED -> human override: guardrail PASSED, deal stands.
         - over authority, REJECTED -> guardrail BREACHED, active_strategy cleared (no PO),
-          negotiation_status FAILED, escalation_reason set — incident returned to human.
+          negotiation_status FAILED, escalation_reason set — incident returned to a human.
         """
         supplier_id = str(best["agreed_supplier_id"])
         unit_price = float(best["agreed_unit_price_usd"])
@@ -1033,7 +910,7 @@ class IncidentCommander:
         LedgerStore.append_raw_log("guardrail", f"spend_authority {check}")
 
         if check.within_authority:
-            # Spend is within delegated authority -> auto-approved, no human needed.
+            # Within delegated authority -> auto-approved, no human needed.
             self.store.mutate({"status": {"guardrail_status": "PASSED"}})
             self._emit(
                 "guardrail",
@@ -1045,8 +922,7 @@ class IncidentCommander:
                 print(f"[GUARDRAIL] {check.reason}")
             return
 
-        # Over authority -> pause and ask a human (HITL). Record the breach first so any
-        # watcher (dashboard) can render the pending decision, then obtain the verdict.
+        # Over authority -> record the breach (so a watcher can render it), then ask a human.
         self.store.mutate(
             {"status": {"guardrail_status": "BREACHED", "escalation_reason": check.reason}}
         )
@@ -1066,10 +942,7 @@ class IncidentCommander:
         if verbose:
             print(f"[GUARDRAIL] BREACHED — {check.reason}")
 
-
-        # Obtain the human verdict. The provider may be SYNC (returns bool) or ASYNC
-        # (returns an awaitable) — await it transparently so the CLI prompt runs off the
-        # event loop while a dashboard can still inject a plain sync callback.
+        # Obtain the verdict. The provider may be sync or async — await it transparently.
         decision = self.human_decision(check)
         if inspect.isawaitable(decision):
             decision = await decision
@@ -1078,7 +951,6 @@ class IncidentCommander:
             "guardrail",
             f"HITL decision approved={approved} supplier={supplier_id} spend={check.spend_usd}",
         )
-
 
         if approved:
             # Human override authorizes the over-limit purchase; the deal proceeds.
@@ -1095,18 +967,13 @@ class IncidentCommander:
                 f"Human APPROVED — PO authorized with {supplier_id} for ${check.spend_usd:,.0f}",
                 approved=True,
             )
-
             if verbose:
                 print(f"[HITL] APPROVED — PO authorized with {supplier_id} for ${check.spend_usd:,.2f}.")
             return
 
-
-        # Human rejected: cancel the purchase (no PO), keep BREACHED, escalate for manual
-        # handling. Clearing active_strategy signals no mitigation was executed — AND we must
-        # also NULL the negotiated primitives. Those terms were written to the ledger the
-        # moment the vendor was selected (just before this guardrail check); leaving them
-        # would strand a phantom PO (supplier/price/lead-time) for a purchase that was
-        # explicitly cancelled, corrupting the single source of truth an ERP would poll.
+        # Human rejected: cancel the purchase, keep BREACHED, escalate. Clearing active_strategy
+        # signals no mitigation executed, and we NULL the negotiated primitives too — otherwise
+        # they'd strand a phantom PO for a cancelled purchase in the single source of truth.
         self.store.mutate(
             {
                 "mitigation": {
@@ -1134,19 +1001,13 @@ class IncidentCommander:
         if verbose:
             print(f"[HITL] REJECTED — no PO placed; incident escalated for manual handling.")
 
-
-
     async def run(self, max_loops: int = MAX_LOOPS, verbose: bool = True) -> List[Dict[str, Any]]:
-        """
-        Execute the autonomous reasoning loop until DONE, goal achieved, or the circuit
-        breaker trips (loop_count > 10). Returns the ordered trace of turns for inspection.
+        """Execute the autonomous reasoning loop until DONE, goal achieved, or the circuit
+        breaker trips (loop_count > max_loops). Returns the ordered trace of turns.
 
-        A running ReAct scratchpad (Thought / Action / Observation per turn) is maintained
-        and injected into each reasoning call, giving the model memory of prior tool
-        observations so it converges instead of repeating the same action.
-
-        This is an async coroutine so it can `await` the negotiation sub-graph, genuinely
-        suspending and resuming per the §4.3 handoff contract.
+        A running ReAct scratchpad is maintained and injected into each reasoning call, giving
+        the model memory of prior observations so it converges instead of repeating actions.
+        Async so it can `await` the negotiation sub-graph.
         """
         trace: List[Dict[str, Any]] = []
 
@@ -1167,9 +1028,8 @@ class IncidentCommander:
             try:
                 decision = await self._reason(ledger_json, scratchpad)
             except LLMUnavailableError as exc:
-                # Reasoning core unreachable (e.g. quota exhausted). Escalate to the
-                # HUMAN TAKEOVER terminal node instead of crashing — the correct
-                # enterprise failure mode when the agent cannot think.
+                # Reasoning core unreachable (e.g. quota exhausted). Escalate to HUMAN TAKEOVER
+                # instead of crashing — the correct enterprise failure mode.
                 LedgerStore.append_raw_log("orchestrator", f"LLM_UNAVAILABLE {exc}")
                 self.store.mutate(
                     {"status": {"escalation_reason": "llm_quota_exhausted"}}
@@ -1196,7 +1056,6 @@ class IncidentCommander:
             self._emit("thought", thought, loop=ledger.metadata.loop_count)
             self._emit("action", tool, tool=tool, args=args)
 
-
             if tool == "DONE":
                 self.store.mutate({"status": {"goal_achieved": True}})
                 trace.append({"thought": thought, "tool": tool, "args": args, "output": None})
@@ -1204,7 +1063,6 @@ class IncidentCommander:
                 if verbose:
                     print("[DONE] Orchestrator reached terminal state.")
                 break
-
 
             if tool not in KNOWN_TOOLS:
                 # Unknown tool syntax -> record an observation and let the model recover.
@@ -1228,9 +1086,8 @@ class IncidentCommander:
 
             mutation_ok = True
             if patch:
-                # Final safety net: a rejected mutation (bad primitive the guards missed)
-                # is converted into a recoverable error Observation instead of crashing
-                # the whole loop. The State Mutation Layer stays the authority on validity.
+                # Final safety net: a rejected mutation becomes a recoverable error Observation
+                # instead of crashing the loop. The State Mutation Layer stays the authority.
                 try:
                     self.store.mutate(patch)
                 except ValidationError as exc:
@@ -1243,34 +1100,26 @@ class IncidentCommander:
 
             # UPDATE STATE LEDGER node: LoopCount++.
             self.store.increment_loop()
-            # Append the full turn (incl. Observation) so the next cycle's scratchpad
-            # carries this tool's result back into the model's context.
+            # Append the full turn (incl. Observation) so the next cycle's scratchpad carries
+            # this tool's result back into the model's context.
             trace.append(
                 {"thought": thought, "tool": tool, "args": args, "output": observation}
             )
 
-            # Committing a strategy is the resolving action for this incident type: once a
-            # valid strategy is selected the goal is achieved, so we close the loop here
-            # (rather than requiring an extra DONE turn that would risk the circuit breaker).
+            # Committing a strategy is the resolving action: once a valid strategy is selected
+            # the goal is achieved, so we close the loop here (no extra DONE turn).
             if tool == "commit_strategy" and mutation_ok:
-                # If ALT_SUPPLIER was chosen, hand off to the async negotiation sub-graph
-                # to secure terms with the alternate vendor. The whole sub-graph counts as
-                # part of THIS single committed turn — no extra increment_loop() is called.
-                # The negotiation may trigger the Financial Spend-Authority Guardrail,
-                # which can hard-fork to a HUMAN-IN-THE-LOOP approve/reject decision.
+                # ALT_SUPPLIER hands off to the async negotiation sub-graph, which counts as part
+                # of THIS committed turn (no extra increment_loop) and may trigger the spend
+                # guardrail / HITL.
                 committed = str(args.get("strategy_type", ""))
                 if committed == "ALT_SUPPLIER":
                     await self._maybe_negotiate(verbose)
 
-                # Only mark RESOLVED if the guardrail did not end BREACHED (i.e. no spend
-                # limit hit, or a human APPROVED the override). A human REJECTION leaves
-                # guardrail_status=BREACHED, so the incident stays escalated for manual
-                # handling rather than being falsely reported as resolved.
+                # Only mark RESOLVED if the guardrail did not end BREACHED. A human REJECTION
+                # leaves guardrail_status=BREACHED, so the incident stays escalated.
                 final = self.store.snapshot()
                 if final.status.guardrail_status == "BREACHED":
-                    # Escalated (guardrail breached and not overridden) — narrate a plain
-                    # English resolution summary so the UI's Zone 3 shows the outcome and the
-                    # exposure that REMAINS unmitigated (no PO placed).
                     self._emit(
                         "resolution",
                         self._summarize_resolution(final),
@@ -1293,37 +1142,28 @@ class IncidentCommander:
                         print("[GOAL ACHIEVED] Strategy committed; incident resolved.")
                 break
 
-
-
         return trace
 
 
-# FIXED incident resources (no scenario presets). The demo has a SINGLE realistic lever —
-# the order quantity — and the agent's autonomous strategy EMERGES from comparing that
-# quantity against these finite resources (no dropdown steers the outcome):
-#   * INTERNAL_TRANSFER surplus : the units PLANT-1 can spare to PLANT-2.
-#   * AIR_FREIGHT capacity      : the finite air cargo volume available on this lane.
-#   * ALT_SUPPLIER              : always feasible (approved alternate-vendor pool).
-# As the quantity grows past each resource the option closes, so the agent escalates
-# INTERNAL_TRANSFER -> AIR_FREIGHT -> ALT_SUPPLIER purely on volume. A SECOND independent
-# lever — the shipment delay (days) — drives the DYNAMIC financial exposure via
-# simulate_finance (bigger delay => bigger projected loss), fully decoupled from the strategy.
+# Fixed incident resources (no scenario presets). The demo has a single realistic lever — the
+# order quantity — and the agent's strategy emerges from comparing it against these finite
+# resources: as the quantity grows past each resource the option closes, escalating
+# INTERNAL_TRANSFER -> AIR_FREIGHT -> ALT_SUPPLIER. A second independent lever — the shipment
+# delay (days) — drives the dynamic financial exposure via simulate_finance.
 INTERNAL_TRANSFER_SURPLUS_UNITS = int(os.environ.get("INTERNAL_TRANSFER_SURPLUS_UNITS", "350"))
 AIR_FREIGHT_CAPACITY_UNITS = int(os.environ.get("AIR_FREIGHT_CAPACITY_UNITS", "420"))
-# Baseline enterprise revenue exposure for the incident (drives penalty + downtime math).
+# Baseline enterprise revenue exposure (drives penalty + downtime math).
 REVENUE_AT_RISK_USD = float(os.environ.get("REVENUE_AT_RISK_USD", "75000"))
-# Observed shipment slip in days — the second live lever (default 9). Bigger => bigger loss.
+# Observed shipment slip in days — the second live lever. Bigger => bigger loss.
 DELAY_DAYS = int(os.environ.get("DELAY_DAYS", "9"))
 
 
 async def main() -> None:
     """Demo entry point: initialize the target incident and run the async loop.
 
-    The incident is driven by TWO independent, realistic levers (no scenario switch):
-      * ORDER_QUANTITY  -> which mitigation is feasible (INTERNAL_TRANSFER / AIR_FREIGHT /
-                           ALT_SUPPLIER), and therefore the agent's autonomous choice + spend.
-      * DELAY_DAYS      -> the shipment slip, which drives the DYNAMIC projected loss.
-    Both are read from the environment so a demo can sweep them without code edits.
+    Driven by two independent env-configurable levers: ORDER_QUANTITY (which mitigation is
+    feasible, and thus the agent's choice + spend) and DELAY_DAYS (the shipment slip, which
+    drives the dynamic projected loss).
     """
     STORE.init_incident(
         target_sku="SKU-99",
@@ -1337,9 +1177,8 @@ async def main() -> None:
         transferable_units=INTERNAL_TRANSFER_SURPLUS_UNITS,
         air_freight_available=True,
         air_freight_capacity_units=AIR_FREIGHT_CAPACITY_UNITS,
-        # Seed the ledger-visible replacement quantity from the SAME value the commander
-        # uses for spend, so the LLM's feasibility check and the guardrail's spend math read
-        # one consistent number (no hidden-state drift).
+        # Seed the ledger-visible replacement quantity from the same value the commander uses
+        # for spend, so the feasibility check and the guardrail's math read one number.
         replacement_order_qty=ORDER_QUANTITY,
         delay_days=DELAY_DAYS,
     )
@@ -1354,8 +1193,6 @@ async def main() -> None:
     await commander.run()
     print("\nFinal ledger:")
     print(STORE.snapshot().model_dump_json(indent=2))
-
-
 
 
 if __name__ == "__main__":
