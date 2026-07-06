@@ -1,20 +1,22 @@
-# Autonomous Supply Chain Incident Commander — dependencies
-# Day 1 foundation. Additional packages (streamlit, colorama, google-adk) added on later days.
+# OSCAR — Operational Supply Chain Autonomous Responder — dependencies.
 
 # Strict typed State Ledger schema + validation (State Mutation Layer enforcement).
 pydantic>=2.6,<3.0
 
-# Model Context Protocol server for the Observation Tools (query_erp/inventory/shipment).
+# Model Context Protocol servers for the Observation Tools (ERP / Inventory-WMS / Logistics-TMS).
 mcp>=1.2.0
 
-# Unified Google Gen AI SDK — the Incident Commander orchestrator reasoning core.
+# Unified Google Gen AI SDK — the Incident Commander reasoning core.
 google-genai>=1.0.0
 
 # Loads GEMINI_API_KEY / GEMINI_MODEL from a local .env file (keeps secrets out of code).
 python-dotenv>=1.0.0
 
-# Day-4 UI dashboard that watches the State Ledger (added ahead of the dashboard build).
+# Streamlit cockpit ("Incident Command Center") that watches the State Ledger.
 streamlit>=1.30.0
 
-# Day-5 Agent CLI — cross-platform colored terminal output for the operator console.
+# Cross-platform colored terminal output for the Agent CLI operator console.
 colorama>=0.4.6
+
+# Test suite (offline, deterministic smoke tests).
+pytest>=8.0

@@ -1,4 +1,5 @@
-# Python virtual environment (never commit — reproducible via documentation/requirements.txt)
+# Python virtual environment (never commit — reproducible via requirements.txt)
+
 .venv/
 venv/
 
