@@ -1,39 +1,25 @@
 """
-dashboard.py
-============
-Streamlit presentation layer for the Autonomous Supply Chain Incident Commander — the
-"Incident Command Center" cockpit.
+Streamlit "Incident Command Center" cockpit for the Incident Commander.
 
-This is the judge-facing window into an otherwise headless, autonomous agent. It is
-deliberately a production-style operations CONSOLE, not a chatbot: the Incident Commander is
-incident-triggered and self-driving, so a chat box would misrepresent it. It visualizes the
-agent's live reasoning as a step-by-step activity log, with the Structured State Ledger
-driving a business vitals strip and a plain-English resolution summary.
+The judge-facing window into an otherwise headless agent — a production-style operations
+console, not a chatbot. It visualizes the agent's live reasoning as a step-by-step activity
+log, with the State Ledger driving a business vitals strip and a plain-English resolution.
 
 Three zones:
-  * Zone 1 — VITALS strip: projected loss / revenue at risk / status.
-  * Zone 2 — ACTIVITY LOG (the hero): each step rendered as a uniform, single-font line with
-             a bold label (Reasoning / Action / Finding / Negotiation / Human Review). The
-             guardrail step uses a green/red status box; the inline Approve/Reject buttons
-             render here when a spend breach awaits a human verdict.
-  * Zone 3 — RESOLUTION summary: a plain-English outcome with a green/red status label.
+  * Zone 1 — vitals strip: projected loss / revenue at risk / status.
+  * Zone 2 — activity log (the hero): each step as a uniform labeled line; the guardrail step
+             uses a green/red box, and the inline Approve/Reject buttons render here when a
+             spend breach awaits a human verdict.
+  * Zone 3 — resolution summary: a plain-English outcome with a green/red status label.
 
-Design (why it's built this way):
-- **Background agent thread.** Streamlit re-runs the whole script on every interaction; the
-  agent is a long-running async loop. We run `asyncio.run(commander.run())` on a worker
-  thread so the UI stays responsive. `ledger_store.STORE` is already thread-safe (RLock).
-- **Observational `on_event` stream.** The orchestrator narrates every step through an
-  `on_event(kind, message, data)` sink (purely observational — it never affects control
-  flow). We append those events and render them as they arrive; in LIVE (Gemini) mode the
-  real model latency naturally spaces the steps out (no artificial pacing).
-- **ASYNC HITL bridge.** The orchestrator's `human_decision` runs INSIDE the agent thread's
-  asyncio event loop. A blocking wait there would freeze that loop (and the concurrent
-  negotiation sub-graph). We inject an ASYNC callback that `await`s an `asyncio.Event`; the
-  UI thread wakes it via `loop.call_soon_threadsafe`.
-- **Live/Offline toggle.** The free Gemini tier is ~20 req/day; rehearsing on the live model
-  would exhaust quota. The sidebar defaults to the deterministic OFFLINE planner and flips to
-  LIVE Gemini only for the final take. The engaged core is shown in the header so it's never
-  ambiguous which reasoning core actually ran.
+Key mechanics:
+- Background agent thread: Streamlit re-runs the whole script on every interaction, so the
+  long-running async loop runs on a worker thread (`ledger_store.STORE` is thread-safe).
+- Observational `on_event` stream: the orchestrator narrates every step; we buffer and render
+  those events as they arrive.
+- Async HITL bridge: `human_decision` runs inside the agent thread's event loop, so it awaits
+  an `asyncio.Event` the UI thread wakes via `loop.call_soon_threadsafe` (never blocking).
+- Live/Offline toggle: defaults to the deterministic offline planner to protect the free tier.
 
 Run it with:  `streamlit run dashboard.py`
 """
@@ -60,13 +46,10 @@ from orchestrator import (
 from guardrails import SpendAuthorityResult, SPEND_AUTHORITY_LIMIT_USD
 
 
-
 # An event is a (kind, human_readable_message, data) triple emitted by the orchestrator.
 EventTuple = Tuple[str, str, Dict[str, Any]]
 
-# Bold label per event `kind`. Production-friendly wording (NOT internal ReAct jargon) in
-# consistent title case. We deliberately avoid emojis in the log text; the only status glyphs
-# live on the guardrail line (green/red box) and the resolution summary.
+# Bold label per event kind. Status glyphs live only on the guardrail line and resolution.
 _STEP_LABEL: Dict[str, str] = {
     "thought": "Reasoning",
     "action": "Action",
@@ -75,9 +58,8 @@ _STEP_LABEL: Dict[str, str] = {
     "hitl": "Human Review",
 }
 
-# Descriptive, business-friendly purpose for each tool the agent can call. The Action line
-# reads "<purpose> — calling `<tool>`" so a judge understands WHY the agent invoked it, not
-# just the raw function name. Deterministic (works identically in live and offline mode).
+# Business-friendly purpose per tool. The Action line reads "<purpose> — calling `<tool>`" so
+# a judge understands why the agent invoked it, not just the raw function name.
 _TOOL_PURPOSE: Dict[str, str] = {
     "extract_contract_rules": "Parsing the supplier contract for the late-delivery penalty",
     "query_shipment_tracking": "Retrieving the latest shipment status and delay",
@@ -91,10 +73,8 @@ _TOOL_PURPOSE: Dict[str, str] = {
 }
 
 
-# CSS to present a clean, production-style console: hide Streamlit's developer chrome (top
-
-# toolbar / Deploy button, hamburger main menu, and the "Made with Streamlit" footer). These
-# add zero value to an enterprise agent demo and look like a dev sandbox otherwise.
+# Hide Streamlit's developer chrome (toolbar/Deploy button, main menu, footer, header) so the
+# demo reads as an enterprise console rather than a dev sandbox.
 _HIDE_CHROME_CSS = """
 <style>
 [data-testid="stToolbar"] { visibility: hidden; height: 0; position: fixed; }
@@ -106,20 +86,16 @@ header { visibility: hidden; }
 
 
 def _md(text: str) -> str:
-    """Escape characters Streamlit markdown would misinterpret.
+    """Escape `$` so Streamlit markdown doesn't render dollar amounts as LaTeX math.
 
-    CRITICAL: Streamlit renders `$...$` as LaTeX math. Our narration is full of dollar
-    amounts (e.g. "at $0 external spend … loss of $20,034"), so an unescaped pair of `$`
-    would swallow the text between them into a serif math font AND drop the currency symbols.
-    Escaping every `$` as `\\$` keeps the money literal and the font uniform.
+    A `$...$` pair would swallow the text between into a math font and drop the currency
+    symbols, so every `$` is escaped as `\\$` to keep money literal and the font uniform.
     """
     return text.replace("$", "\\$")
 
 
-# Inline "green circle with a white check" badge — a real filled circle (border-radius 50%)
-# with a centered ✓, rendered via HTML so we control the exact look (st.status can only show
-# its own flat glyph). Prepended to every COMPLETED step/negotiation header. Kept tiny and
-# vertically-aligned so it sits neatly before the title text.
+# Inline green-circle-with-white-check badge, rendered via HTML so we control the exact look
+# (st.status can only show its own flat glyph). Prepended to every completed step header.
 _DONE_BADGE = (
     "<span style='display:inline-flex;align-items:center;justify-content:center;"
     "width:1.15em;height:1.15em;border-radius:50%;background:#22c55e;color:#fff;"
@@ -133,18 +109,17 @@ def _done_header(title: str) -> str:
     return f"{_DONE_BADGE}<b>{_md(title)}</b>"
 
 
-
 # --------------------------------------------------------------------------- #
 # Async HITL bridge — the safe cross-thread pause/resume for the guardrail.
 # --------------------------------------------------------------------------- #
 class HITLBridge:
     """Async human-decision provider that pauses the agent's event loop for a UI verdict.
 
-    `decide` runs on the AGENT thread's event loop (the orchestrator awaits it). It records
-    the breach details, then `await`s an `asyncio.Event` — yielding control to the loop
-    (never blocking it). The UI thread renders Approve/Reject buttons; clicking one calls
-    `resolve`, which wakes the coroutine via `loop.call_soon_threadsafe` (the ONLY
-    thread-safe way to signal an asyncio primitive from another thread).
+    `decide` runs on the agent thread's event loop (the orchestrator awaits it): it records the
+    breach details, then awaits an `asyncio.Event`, yielding control to the loop. The UI thread
+    renders Approve/Reject buttons; clicking one calls `resolve`, which wakes the coroutine via
+    `loop.call_soon_threadsafe` — the only thread-safe way to signal an asyncio primitive from
+    another thread.
     """
 
     def __init__(self) -> None:
@@ -169,7 +144,7 @@ class HITLBridge:
         return bool(self._decision)
 
     def resolve(self, approved: bool) -> None:
-        """Called FROM THE UI THREAD when the operator clicks Approve/Reject."""
+        """Called from the UI thread when the operator clicks Approve/Reject."""
         self._decision = approved
         loop, event = self._loop, self._event
         if loop is not None and event is not None:
@@ -185,8 +160,8 @@ class HITLBridge:
 
 # --------------------------------------------------------------------------- #
 # Per-session shared state (survives Streamlit reruns via st.session_state).
-# The background thread mutates the plain attributes below directly (NOT via the
-# st.session_state API, which is not safe to touch from a non-UI thread).
+# The background thread mutates the plain attributes below directly (the st.session_state API
+# is not safe to touch from a non-UI thread).
 # --------------------------------------------------------------------------- #
 @dataclass
 class AgentSession:
@@ -199,26 +174,22 @@ class AgentSession:
     events: List[EventTuple] = field(default_factory=list)
     # Which reasoning core actually engaged this run ("LIVE · <model>" or "OFFLINE …").
     core_mode: str = ""
-    # The (order_qty, delay) the currently-displayed run used — so the UI can auto-clear a
-    # stale flow when the operator changes an input without pressing Reset first.
+    # The (order_qty, delay) the currently-displayed run used, so the UI can auto-clear a stale
+    # flow when the operator changes an input without pressing Reset first.
     run_params: Tuple[int, int] = (0, 0)
     # Last STORE revision the UI observed — used by the stale-snapshot convergence guard.
     last_revision: int = -1
-    # Latched terminal outcome ("resolved" | "escalated"), set EXACTLY ONCE from the
-    # orchestrator's final resolution event when the run settles. Monotonic: once set it never
-    # flips, so the vitals + Zone-3 label can never flicker between Escalated and Resolved
-    # during the brief post-HITL settling window (the earlier bug). None until settled.
+    # Latched terminal outcome ("resolved" | "escalated"), set exactly once when the run
+    # settles. Monotonic: once set it never flips, so the vitals + Zone-3 label can't flicker
+    # between Escalated and Resolved during the post-HITL settling window. None until settled.
     outcome: Optional[str] = None
-
-
-
 
 
 def _on_event(sess: AgentSession):
     """Build the orchestrator `on_event` callback that buffers the live step stream.
 
-    Runs on the AGENT thread. We only append to a plain list (thread-safe enough for a demo
-    — appends are atomic under CPython's GIL) and never touch the st.session_state API here.
+    Runs on the agent thread; only appends to a plain list (atomic under CPython's GIL) and
+    never touches the st.session_state API.
     """
 
     def _cb(kind: str, message: str, data: Dict[str, Any]) -> None:
@@ -233,16 +204,16 @@ def _on_event(sess: AgentSession):
 def _run_agent(sess: AgentSession, params: Dict[str, Any]) -> None:
     """Background-thread entry point: configure the run, then drive the async loop.
 
-    Runs entirely off the Streamlit UI thread. Sets the reasoning-core / vendor mode via
-    env (read at commander construction), initializes the incident, then `asyncio.run`s the
-    orchestrator to completion. The original API key is passed IN (captured in session_state
-    on the UI thread) and `os.environ` is restored in `finally` so a prior OFFLINE run can
-    never clobber the key for a later LIVE run.
+    Sets the reasoning-core / vendor mode via env (read at commander construction), then
+    `asyncio.run`s the orchestrator to completion. The original API key is passed in (captured
+    on the UI thread) and `os.environ` is restored in `finally` so a prior OFFLINE run can't
+    clobber the key for a later LIVE run. The ledger is initialized on the UI thread in
+    `_start` before this thread spawns, so it always exists when the UI reads it.
     """
     saved_key = os.environ.get("GEMINI_API_KEY", "")
     saved_vendor = os.environ.get("VENDOR_MODE", "")
     try:
-        # --- Reasoning core selection (Offline default protects the free quota). --------
+        # Reasoning core selection (offline default protects the free quota).
         if params["offline"]:
             os.environ["GEMINI_API_KEY"] = ""            # -> deterministic offline planner
             os.environ["VENDOR_MODE"] = "deterministic"  # -> scripted vendor (no LLM calls)
@@ -250,19 +221,13 @@ def _run_agent(sess: AgentSession, params: Dict[str, Any]) -> None:
             os.environ["GEMINI_API_KEY"] = params["gemini_key"]  # -> live Gemini core
             os.environ["VENDOR_MODE"] = "llm"
 
-        # NOTE: the incident ledger is initialized SYNCHRONOUSLY on the UI thread in
-        # `_start` (before this thread is spawned), so it is guaranteed to exist by the time
-        # the UI reads `STORE.snapshot()`. We do NOT init it here — doing so on the worker
-        # thread created an init race the UI could only paper over with an exception + sleep.
         commander = IncidentCommander(
-
             order_quantity=params["order_quantity"],
             spend_authority_limit_usd=params["spend_limit"],
-            human_decision=sess.bridge.decide,  # ASYNC bridge — awaited by the orchestrator
+            human_decision=sess.bridge.decide,  # async bridge — awaited by the orchestrator
             on_event=_on_event(sess),           # observational step stream -> Zone 2 log
         )
-        # Record which core actually engaged so the header can show it truthfully (and the
-        # operator knows when a run spent live quota). Derived from the real client bootstrap.
+        # Record which core actually engaged so the header can show it truthfully.
         sess.core_mode = (
             f"LIVE · {GEMINI_MODEL}" if commander.llm_enabled else "OFFLINE · deterministic planner"
         )
@@ -271,8 +236,7 @@ def _run_agent(sess: AgentSession, params: Dict[str, Any]) -> None:
         sess.error = repr(exc)
         LedgerStore.append_raw_log("dashboard", f"AGENT_THREAD_ERROR {exc!r}")
     finally:
-        # Restore the process env so mode selection never leaks between runs (this is what
-        # previously broke the LIVE toggle after an OFFLINE run cleared the key).
+        # Restore the process env so mode selection never leaks between runs.
         os.environ["GEMINI_API_KEY"] = saved_key
         os.environ["VENDOR_MODE"] = saved_vendor
         sess.running = False
@@ -288,12 +252,11 @@ def _get_session() -> AgentSession:
 
 
 def _get_original_key() -> str:
-    """Capture the real GEMINI_API_KEY ONCE in session_state.
+    """Capture the real GEMINI_API_KEY once in session_state.
 
-    Streamlit re-executes the whole script every rerun, and a prior OFFLINE run sets
-    os.environ["GEMINI_API_KEY"]="" — so a module-level capture would read back "" and
-    silently disable the LIVE toggle. Storing it in session_state (which persists across
-    reruns) makes the captured key immune to that env-clobber.
+    A prior OFFLINE run sets os.environ["GEMINI_API_KEY"]="", so a module-level capture would
+    read back "" and silently disable the LIVE toggle. session_state persists across reruns,
+    making the captured key immune to that env-clobber.
     """
     if "original_gemini_key" not in st.session_state:
         st.session_state.original_gemini_key = os.environ.get("GEMINI_API_KEY", "")
@@ -301,13 +264,11 @@ def _get_original_key() -> str:
 
 
 def _start(sess: AgentSession, params: Dict[str, Any]) -> None:
-    """Spawn the agent thread ONCE (guard against Streamlit's per-interaction reruns).
+    """Spawn the agent thread once (guarded against Streamlit's per-interaction reruns).
 
-    INIT ORDER (fixes the init race): the incident ledger is initialized SYNCHRONOUSLY here,
-    on the UI thread, BEFORE the worker thread is spawned. This guarantees `STORE.snapshot()`
-    always succeeds on the next rerun — so the UI needs no exception-handler-plus-sleep hack
-    to tolerate an uninitialized ledger. `init_incident` is a fast, lock-protected in-memory
-    call, so running it on the UI thread is safe and cheap.
+    The incident ledger is initialized synchronously here, on the UI thread, before the worker
+    thread spawns — so `STORE.snapshot()` always succeeds on the next rerun. `init_incident` is
+    a fast, lock-protected in-memory call, so running it on the UI thread is safe and cheap.
     """
     if sess.running:
         return
@@ -317,10 +278,7 @@ def _start(sess: AgentSession, params: Dict[str, Any]) -> None:
     sess.last_revision = -1
     sess.error = None
 
-    # Establish the single source of truth up front (UI thread) — the worker thread will only
-    # read/mutate it, never (re-)create it. The agent's strategy EMERGES from comparing the
-    # order quantity against the finite resources (surplus 350 / air capacity 420); the delay
-    # independently drives the dynamic projected loss (no scenario switch steers the outcome).
+    # Establish the single source of truth up front; the worker thread only reads/mutates it.
     STORE.init_incident(
         target_sku="SKU-99",
         primary_supplier_id="SUP-A",
@@ -341,13 +299,10 @@ def _start(sess: AgentSession, params: Dict[str, Any]) -> None:
     # operator changes an input without pressing Reset.
     sess.run_params = (int(params["order_quantity"]), int(params["delay_days"]))
 
-
     sess.running = True
     sess.started = True
     sess.thread = threading.Thread(target=_run_agent, args=(sess, params), daemon=True)
     sess.thread.start()
-
-
 
 
 def _reset(sess: AgentSession) -> None:
@@ -363,18 +318,14 @@ def _thread_alive(sess: AgentSession) -> bool:
 # Zone renderers
 # --------------------------------------------------------------------------- #
 def _render_vitals(ledger: Any, running: bool, outcome: Optional[str]) -> None:
-    """Zone 1 — the business vitals strip. Reads the live ledger (single source of truth).
+    """Zone 1 — the business vitals strip (loss / revenue / status).
 
-    Deliberately shows BUSINESS metrics only (loss / revenue / status). The internal ReAct
-    loop counter is NOT surfaced — a real operations console reports outcomes, not the
-    agent's internal iteration mechanics.
+    Shows business metrics only; the internal ReAct loop counter is not surfaced. Status is
+    derived from the latched `outcome` (set once when the run settles), never re-derived from
+    the live ledger — this is what prevents the Escalated↔Resolved flicker.
     """
     metrics = ledger.metrics
 
-    # Status is derived from the LATCHED `outcome` (set once when the run settles), NEVER
-    # re-derived from the live ledger — that is what killed the Escalated↔Resolved flicker:
-    # while running we show "In progress"; once settled we show the single, monotonic terminal
-    # label. `outcome` can only ever be set to one value for a given run, so it cannot flip.
     if running or outcome is None:
         status_label = "In progress" if running else "Standby"
         status_help = "Agent is working the incident" if running else "Awaiting dispatch"
@@ -397,11 +348,7 @@ def _thought_text(message: str) -> str:
 
 
 def _action_text(message: str, data: Dict[str, Any]) -> str:
-    """Descriptive Action line: '<purpose> — calling <tool>' (falls back to the tool name).
-
-    The orchestrator emits the raw tool name as the action message; we translate it into a
-    business-friendly purpose so a judge sees WHY the tool was called, not just its name.
-    """
+    """Descriptive Action line: '<purpose> — calling <tool>' (falls back to the tool name)."""
     tool = str(data.get("tool") or message).strip()
     purpose = _TOOL_PURPOSE.get(tool)
     if purpose:
@@ -409,19 +356,14 @@ def _action_text(message: str, data: Dict[str, Any]) -> str:
     return f"Calling 🔧 `{tool}` tool."
 
 
-
 def _render_react_card(steps: List[EventTuple]) -> None:
-    """Render one COMPLETED ReAct turn (Reasoning → Action → Finding) as a static block.
+    """Render one completed ReAct turn (Reasoning → Action → Finding) as a static block.
 
-    DESIGN (why NOT st.status): st.status widgets re-mount on every one of our ~0.4s
-    auto-reruns, which restarts their spinner and causes visible flicker; their label is also
-    plain text, so we can't render a custom green-circle tick inside it. Instead we render a
-    STATIC header — a green-circle-white-check badge (`_done_header`) + the step title — with
-    the Reasoning / Action / Finding detail tucked into a COLLAPSED `st.expander`. Static
-    markdown + a plain expander don't re-mount/animate on reruns, so there is ZERO flicker,
-    and the tick is exactly the circled green check requested. The single live "reasoning…"
-    spinner (shown separately at the tail of the log while the thread is alive) is the honest
-    in-progress indicator — the real LLM latency happens BETWEEN cards, not within one.
+    Uses a static header (green-circle-check badge + title) with the detail in a collapsed
+    expander, rather than st.status — st.status re-mounts on every ~0.4s auto-rerun (restarting
+    its spinner and flickering) and can't host a custom icon. Static markdown doesn't re-mount,
+    so there's zero flicker. The single live "reasoning…" spinner at the tail of the log is the
+    honest in-progress cue (real LLM latency happens between cards, not within one).
     """
     # Card title = the tool/action purpose if known, else a generic "Reasoning step".
     title = "Reasoning step"
@@ -444,20 +386,16 @@ def _render_react_card(steps: List[EventTuple]) -> None:
                     st.markdown(f"**Finding** — {_md(body)}")
 
 
-
 def _render_negotiation(steps: List[EventTuple], is_last: bool, running: bool) -> None:
     """Render the supplier negotiation block (same static treatment as the ReAct cards).
 
-    While the sub-graph is still bargaining (agent running, this is the tail block, and no
-    winning quote has landed yet) we show a live "Negotiating with SUP-B and SUP-C…" spinner
-    via `st.status(state="running")`. Once the "Best quote secured" line arrives — or the run
-    ends — it renders as a STATIC "Negotiation successful" header with the same green-circle
-    check badge as the cards, and the buyer<->supplier chat transcript inside a COLLAPSED
-    expander. (Static-once-done avoids the st.status re-mount flicker; the transient spinner
-    only appears during the genuinely-in-progress LIVE window.)
+    While the sub-graph is still bargaining, show a plain static "Negotiating with …" line
+    (not an st.status widget, which would flicker on reruns). Once the winning quote arrives —
+    or the run ends — render a static "Negotiation successful" header with the buyer<->supplier
+    transcript in a collapsed expander.
     """
-    # Discover the vendors being negotiated with (from the opening system event's `vendors`
-    # datum; fall back to the distinct supplier ids seen in the transcript).
+    # Discover the vendors being negotiated with (from the opening event's `vendors` datum;
+    # fall back to the distinct supplier ids seen in the transcript).
     vendors = ""
     for _k, _m, data in steps:
         if data.get("vendors"):
@@ -465,8 +403,7 @@ def _render_negotiation(steps: List[EventTuple], is_last: bool, running: bool) -
             break
     if not vendors:
         seen = [str(d["supplier"]) for _k, _m, d in steps if d.get("supplier")]
-        # de-dupe preserving order
-        vendors = ", ".join(dict.fromkeys(seen))
+        vendors = ", ".join(dict.fromkeys(seen))  # de-dupe preserving order
     vendors_phrase = vendors.replace(", ", " and ") if vendors else "alternate suppliers"
 
     # Done when the winning-quote system line has arrived (or the run has otherwise ended).
@@ -477,8 +414,7 @@ def _render_negotiation(steps: List[EventTuple], is_last: bool, running: bool) -
     def _emit_transcript() -> None:
         for _k, message, data in steps:
             role = str(data.get("role", "system"))
-            # Skip the orchestrator's opening "Negotiating concurrently with N alternate
-            # suppliers…" framing line — it's redundant once the header states the outcome.
+            # Skip the redundant "Negotiating concurrently with N …" framing line.
             if role == "system" and str(message).startswith("Negotiating concurrently"):
                 continue
             if role == "buyer":
@@ -489,33 +425,24 @@ def _render_negotiation(steps: List[EventTuple], is_last: bool, running: bool) -
                 with st.chat_message("assistant", avatar="🏭"):
                     st.markdown(_md(f"**{sid}:** {message}"))
             else:
-                # System framing lines (bidding open / best quote) as a plain notice.
                 st.markdown(_md(message))
 
     if not done:
-        # Genuinely in-progress (LIVE bargaining window). Render a PLAIN STATIC line — NOT an
-        # st.status widget, which re-mounts on every 0.4s rerun and flickers. Plain markdown
-        # re-prints identically each rerun, so it's flicker-free; the single tail
-        # "Agent is reasoning…" spinner provides the live motion cue.
+        # In-progress: a plain static line (flicker-free); the tail spinner gives the motion cue.
         st.markdown(f"**Negotiating with {vendors_phrase}…**")
         return
 
-    # Completed: STATIC green-circle header + collapsed transcript (no flicker on reruns).
+    # Completed: static green-circle header + collapsed transcript.
     st.markdown(_done_header("Negotiation successful"), unsafe_allow_html=True)
     with st.expander("View negotiation transcript", expanded=False):
         _emit_transcript()
 
 
-
-
-
-
 def _render_activity_log(sess: AgentSession) -> None:
     """Zone 2 — the activity log (the hero of the console).
 
-    Consecutive Reasoning → Action → Finding events are grouped into a single status card
-    (spinner while processing, green check when done). Negotiation events are collected and
-    rendered together as a supplier chat. Guardrail lines keep their green/red status box.
+    Consecutive Reasoning → Action → Finding events are grouped into a single card; negotiation
+    events render together as a supplier chat; guardrail lines keep their green/red box.
     """
     st.subheader("Agent activity")
 
@@ -526,7 +453,7 @@ def _render_activity_log(sess: AgentSession) -> None:
     # Partition the flat event stream into ordered render blocks:
     #   ("card", [thought/action/observation events])  — one ReAct turn
     #   ("negotiation", [negotiation events])           — the supplier chat
-    #   ("guardrail", event)                             — a single guardrail line
+    #   ("guardrail" / "hitl", event)                    — a single line
     blocks: List[Tuple[str, Any]] = []
     card: List[EventTuple] = []
     negotiation: List[EventTuple] = []
@@ -569,7 +496,6 @@ def _render_activity_log(sess: AgentSession) -> None:
             _render_react_card(payload)
         elif block_kind == "negotiation":
             _render_negotiation(payload, is_last, sess.running)
-
         elif block_kind == "guardrail":
             _k, message, data = payload
             if data.get("passed"):
@@ -580,17 +506,13 @@ def _render_activity_log(sess: AgentSession) -> None:
             _k, message, _data = payload
             st.markdown(f"**Human Review** — {_md(str(message))}")
 
-    # LIVE "working" indicator: a single spinner at the TAIL of the log while the agent
-    # thread is still alive. This is the honest in-progress cue — the real LLM latency happens
-    # BETWEEN steps (inside _reason, before the next card exists), so a per-card spinner can
-    # never show; one tail spinner tied to `running` captures that dead-air correctly and,
-    # being a single element, cannot flicker. (Offline finishes in ~ms so it's rarely seen.)
+    # A single tail spinner while the agent thread is alive — the honest in-progress cue (real
+    # LLM latency happens between steps, so a per-card spinner can never show).
     if sess.running and not (sess.bridge.pending and sess.bridge.result is not None):
         st.status("🧠 Agent is reasoning…", state="running", expanded=False)
 
-
-    # Inline HITL approval gate — rendered at the tail of the log when a spend breach is
-    # actively awaiting a human verdict (the agent's event loop is paused on the bridge).
+    # Inline HITL approval gate — rendered when a spend breach awaits a human verdict (the
+    # agent's event loop is paused on the bridge).
     if sess.bridge.pending and sess.bridge.result is not None:
         r = sess.bridge.result
         st.divider()
@@ -609,15 +531,12 @@ def _render_activity_log(sess: AgentSession) -> None:
             st.rerun()
 
 
-
 def _render_resolution(sess: AgentSession, outcome: Optional[str]) -> None:
     """Zone 3 — plain-English resolution summary with a thin green/red status label.
 
-    Uses the orchestrator's streamed `resolution` event text for the body, and the LATCHED
-    `outcome` ("resolved"/"escalated") for the color label — NOT a fresh ledger read — so the
-    label is monotonic and can never flip during the post-approve settling window. The body is
-    rendered as normal markdown (unified font, `$` escaped); the color cue is a compact status
-    label above it (not a full alert box) so the font matches the log.
+    Uses the orchestrator's streamed `resolution` event text for the body and the latched
+    `outcome` for the color label (not a fresh ledger read), so the label is monotonic and
+    can't flip during the post-approve settling window.
     """
     resolution_msg: Optional[str] = None
     for kind, message, _data in reversed(sess.events):
@@ -645,7 +564,6 @@ def _render_resolution(sess: AgentSession, outcome: Optional[str]) -> None:
     st.markdown(_md(body))
 
 
-
 def main() -> None:
     st.set_page_config(page_title="Incident Command Center", layout="wide")
     st.markdown(_HIDE_CHROME_CSS, unsafe_allow_html=True)
@@ -663,19 +581,15 @@ def main() -> None:
             "(uses your API quota). Default ON to protect the free tier.",
             disabled=sess.running,
         )
-        # Live-mode requires a Gemini API key. Surface that requirement inline the moment the
-        # operator turns Offline OFF, so it's obvious a key must be present in the .env — and
-        # that the run gracefully falls back to the deterministic planner if it's missing.
+        # Surface the API-key requirement the moment Offline is turned OFF.
         if not offline:
             st.caption(
                 "Live mode needs `GEMINI_API_KEY` in `.env`; without it, it falls back to "
                 "the offline planner."
             )
 
-
-        # ORDER QUANTITY — the single lever the agent's strategy EMERGES from (no scenario
-        # switch). It is compared against the fixed resources below; a bigger order closes
-        # cheaper options and pushes the agent up the escalation ladder.
+        # Order quantity — the single lever the agent's strategy emerges from. Compared against
+        # the fixed resources; a bigger order closes cheaper options and escalates the ladder.
         order_quantity = st.number_input(
             "Order quantity (units)",
             min_value=1,
@@ -692,8 +606,7 @@ def main() -> None:
             disabled=sess.running,
         )
 
-        # SHIPMENT DELAY — the second, independent lever. Drives the DYNAMIC projected loss
-        # (bigger delay => bigger exposure), decoupled from the strategy choice.
+        # Shipment delay — the second, independent lever. Drives the dynamic projected loss.
         delay_days = st.number_input(
             "Shipment delay (days)",
             min_value=0,
@@ -706,11 +619,8 @@ def main() -> None:
             disabled=sess.running,
         )
 
-        # The spend-authority limit is a FIXED delegated signing authority — in a real
-
-        # enterprise it's set by senior management and locked, not re-tuned per incident. So
-        # we display it as a read-only notice rather than an editable field; the constant is
-        # passed straight through to the agent.
+        # The spend-authority limit is a fixed delegated signing authority — displayed as a
+        # read-only notice; the constant is passed straight through to the agent.
         st.caption(
             f"Spend authority: **${SPEND_AUTHORITY_LIMIT_USD:,.0f}** — fixed delegated limit; "
             "spend above this escalates to a human."
@@ -738,11 +648,9 @@ def main() -> None:
         if not offline and not original_key:
             st.warning("No API key found — a live run will fall back to the offline planner.")
 
-    # AUTO-CLEAR STALE FLOW: if a previous run is displayed (started, not running) and the
-    # operator changes the order quantity or delay without pressing Reset, wipe the old flow
-    # so the UI cleanly returns to the "press Start" state for the new inputs — otherwise the
-    # old run's cards/chat linger and visually fight the next run. Only fires between runs
-    # (the inputs are disabled while running), so it's safe.
+    # Auto-clear a stale flow: if a previous run is displayed (started, not running) and the
+    # operator changes an input without pressing Reset, wipe the old flow so the UI cleanly
+    # returns to "press Start". Only fires between runs (inputs are disabled while running).
     current_params = (int(order_quantity), int(delay_days))
     if (
         sess.started
@@ -753,9 +661,7 @@ def main() -> None:
         _reset(sess)
         st.rerun()
 
-
     # ------------------------------- Header -------------------------------------------- #
-
     st.title("Autonomous Supply Chain Incident Commander")
     st.caption(
         "An autonomous, incident-triggered agent that reasons over a structured state "
@@ -773,18 +679,13 @@ def main() -> None:
         )
         return
 
-
-
     if sess.error:
         st.error(f"Agent error: {sess.error}")
 
-    # Read the live ledger (thread-safe). It was initialized SYNCHRONOUSLY in `_start` before
-    # the worker thread was spawned, so once `sess.started` is true the ledger always exists —
-    # no exception-handler + sleep hack needed for cross-thread init timing.
+    # Read the live ledger (thread-safe; initialized in `_start` before the worker spawned).
     ledger = STORE.snapshot()
 
     ctx = ledger.context
-
     meta = ledger.metadata
     core_note = f" · Core: {sess.core_mode}" if sess.core_mode else ""
     st.caption(
@@ -792,11 +693,9 @@ def main() -> None:
         f"· Severity {meta.severity}{core_note}"
     )
 
-    # LATCH THE TERMINAL OUTCOME ONCE (flicker fix): the moment the run has genuinely settled
-    # (thread dead), record "resolved"/"escalated" a SINGLE time from the orchestrator's final
-    # `resolution` event (which carries a `resolved` bool) — never re-derived from the live
-    # ledger. Because it's written once and then frozen, the vitals + Zone-3 label can't flip
-    # between Escalated and Resolved during the post-approve settling repaints.
+    # Latch the terminal outcome once, when the run has settled (thread dead): record
+    # "resolved"/"escalated" a single time from the final `resolution` event, never re-derived
+    # from the live ledger — so the vitals + Zone-3 label can't flip during post-approve repaints.
     finished = not sess.running and not _thread_alive(sess)
     if finished and sess.outcome is None:
         resolved = True
@@ -817,10 +716,8 @@ def main() -> None:
     _render_activity_log(sess)
 
     # ------------------------------- Zone 3: resolution -------------------------------- #
-    # Only shown once the incident has SETTLED (resolved/escalated) — including the State
-    # Ledger JSON, which is the concrete "single source of truth" architecture proof judges
-    # can inspect. Kept out of the live view (mid-run JSON is noise) and surfaced only at the
-    # end as an audit artifact.
+    # Shown once the incident has settled, including the State Ledger JSON as the concrete
+    # "single source of truth" audit artifact (kept out of the live view as mid-run noise).
     if finished:
         st.divider()
         _render_resolution(sess, sess.outcome)
@@ -828,12 +725,10 @@ def main() -> None:
         with st.expander("State Ledger (JSON) — single source of truth"):
             st.json(ledger.model_dump(mode="json"))
 
-
     # ------------------------------- Live refresh loop --------------------------------- #
-    # Keep repainting while the agent is working or a HITL decision is pending, plus extra
-    # passes until the store revision stabilizes. This is the STALE-SNAPSHOT FIX: only when
-    # the thread is dead AND the revision has settled do we stop — so the vitals converge to
-    # the true final numbers instead of freezing on an early $0 snapshot.
+    # Keep repainting while the agent works or a HITL decision is pending, plus extra passes
+    # until the store revision stabilizes — so the vitals converge to the true final numbers
+    # instead of freezing on an early $0 snapshot.
     revision_advancing = STORE.revision != sess.last_revision
     sess.last_revision = STORE.revision
 
